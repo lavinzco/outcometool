@@ -1,0 +1,11 @@
+{
+  "initial_equity": 1000.0,
+  "final_equity": 995.99,
+  "return_pct": -0.401,
+  "max_drawdown_pct": 0.994,
+  "settlement_fee_note": "configurable parameter; not a verified official rate",
+  "live_orders": false,
+  "settled_trades": 2,
+  "rejected_signals": 3,
+  "calibration_rows": 4
+}
