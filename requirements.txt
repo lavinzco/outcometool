@@ -1,2 +1,5 @@
 numpy
 websockets
+pandas
+requests
+scipy

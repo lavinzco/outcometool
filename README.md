@@ -2,7 +2,7 @@
 
 配套 `outcome_hip4_engine.py` 使用：实时纸面模拟（`paper`）和离线回测导出（`export-backtest`）。只做模拟撮合，不下真单。
 
-把 `outcome_hip4_engine.py` 放在与本脚本同一目录后再运行主流程。本目录暂不包含引擎源码。
+引擎源码已在本目录 `outcome_hip4_engine.py`；`pip install -r requirements.txt` 同时覆盖引擎与导出脚本。
 
 ## 依赖
 
