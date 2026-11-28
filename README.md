@@ -16,7 +16,7 @@ pip install -r requirements.txt
 # 记账 / 结算 / 复盘单测（不需要联网；复盘单测需要上面的依赖）
 python -m unittest test_paper_export.py test_outcome_review.py
 
-# 查看命令说明（不需要引擎）
+# 查看命令说明（启动时会 import 同目录的引擎）
 python outcome_paper_export.py -h
 
 # 实时纸面模拟，默认连 mainnet 行情，仍不下真单
@@ -26,7 +26,11 @@ python outcome_paper_export.py paper --minutes 120 --out-dir paper_logs
 python outcome_paper_export.py export-backtest --db hip4_replay.sqlite --out-dir bt_exports
 ```
 
-`--settlement-fee` 默认 `0.0007`，只是可配参数，不是已核实的官方费率。
+`--settlement-fee` 默认 `0.0007`，只是可配参数，不是已核实的官方费率。这个工具只做纸面模拟，不下真单。
+
+默认仍直接写到 `--out-dir`。可选 `--out-root` 会写到该目录下的 run_id 子目录，`--subdir-by-run-id` 会在 `--out-dir` 下再按 run_id 分子目录。不传这两个参数时，`outcome_review.py` 原来的路径继续可用。
+
+纸面目录里复盘仍用 `paper_orders.csv`、`paper_settlements.csv`、`paper_open_positions.csv` 和 `paper_summary.json`（顶层有 `initial_equity`）。回测目录里复盘仍用 `bt_trades.csv`、`bt_rejected.csv`、`bt_calibration.csv` 和 `bt_summary.json`。同一次运行还会多写诊断文件 `decisions.csv`、`market_outcomes.csv` 和 `run_metadata.json`。
 
 ## 复盘
 
@@ -62,7 +66,7 @@ Equity curve and MaxDD use settlement-time equity_after only, in file order (not
 - 时间戳改为带 `Z` 的 ISO UTC
 - 回测增加 `bt_summary.json`；拒单表字段对齐
 
-未加“每个市场只能开一笔”的限制。如果引擎在每次盘口更新时都给出信号，仍可能连打多笔。
+同一市场的开仓次数跟着引擎配置 `max_trades_per_market`（默认 1）。达到上限后这次运行不再为该市场开新仓。
 
 ## 未验证
 
