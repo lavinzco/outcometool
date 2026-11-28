@@ -1,0 +1,2 @@
+order_id,settle_time_utc,outcome_id,underlying,side,won,filled_shares,fill_vwap,cost_usdc,payout_usdc,pnl_usdc,equity_after,fair_prob,tau_sec,slippage
+A,2024-06-01T00:20:00.000Z,1,BTC,UP,1,10,0.4,4,9.99,5.99,1005.99,0.6,30,0.01

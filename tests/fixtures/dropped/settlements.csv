@@ -1,0 +1,7 @@
+order_id,pnl_usdc,equity_after,tau_sec,won,fair_prob,cost_usdc,filled_shares,fill_vwap,slippage,eff_settle_fee,side
+KEEP1,1.0,1001.0,30,1,0.6,4,10,0.4,0.01,0.001,UP
+MISS_PNL,,1002.0,40,1,0.6,4,10,0.4,0.01,0.001,UP
+MISS_EQ,2.0,,50,1,0.6,4,10,0.4,0.01,0.001,UP
+MISS_TAU,3.0,1003.0,,1,0.6,4,10,0.4,0.01,0.001,UP
+MISS_EQ_TAU,4.0,,,0,0.5,4,10,0.4,0.01,0.001,DOWN
+KEEP2,5.0,1005.0,90,0,0.4,4,10,0.4,0.01,0.001,DOWN

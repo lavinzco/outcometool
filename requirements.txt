@@ -3,3 +3,4 @@ websockets
 pandas
 requests
 scipy
+matplotlib

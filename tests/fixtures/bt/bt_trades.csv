@@ -1,0 +1,3 @@
+outcome_id,underlying,signal_utc,exec_utc,side,strike,mark_px_signal,settled_twap,ann_vol,tau_sec,z_score,fair_prob,top_ask_signal,fill_vwap,slippage,shares,cost_usdc,eff_settle_fee,won,pnl_usdc,equity_after
+m-later,BTC,2024-06-01T00:09:00.000Z,2024-06-01T00:10:00.000Z,UP,60000,60100,60110,0.50,30,1.2,0.60,0.39,0.40,0.01,10,4.0,0.001,1,5.99,1005.99
+m-earlier,BTC,2024-06-01T00:04:00.000Z,2024-06-01T00:05:00.000Z,DOWN,60000,59900,59800,0.50,120,-0.4,0.55,0.48,0.50,0.02,20,10.0,0.001,0,-10.0,995.99
