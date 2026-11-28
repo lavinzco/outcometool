@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import websockets
 
 import outcome_hip4_engine as engine_mod
+from market_data import BookEvent, LiveMarketFeed, MarkEvent, MarketTapeWriter
 from outcome_hip4_engine import (
     ENDPOINTS,
     HIP4AsianBinaryStrategy,
@@ -1139,6 +1139,7 @@ async def run_paper_trading(
     subdir_by_run_id: bool,
     duration_min: float,
     poll_meta_sec: float = 20.0,
+    db_path: str = "hip4_replay.sqlite",
 ):
     underlying = underlying.upper()
     start_ts = time.time()
@@ -1146,11 +1147,12 @@ async def run_paper_trading(
     run_id = make_run_id("paper", underlying, period)
     out_dir = resolve_output_dir(out_dir_arg, out_root_arg, run_id, subdir_by_run_id)
 
-    # 同时保留 outcome_review.py 所需文件 + 新增审计文件
+    # 同时保留 outcome_review.py 所需文件 + 新增审计文件 + 同 schema SQLite 磁带
     order_logger = LiveCSVLogger(out_dir / "paper_orders.csv", PAPER_ORDER_FIELDS)
     settle_logger = LiveCSVLogger(out_dir / "paper_settlements.csv", SETTLE_FIELDS)
     decision_logger = LiveCSVLogger(out_dir / "decisions.csv", DECISION_FIELDS)
     outcome_logger = LiveCSVLogger(out_dir / "market_outcomes.csv", OUTCOME_FIELDS)
+    tape_writer = MarketTapeWriter(db_path)
 
     bookkeeper = EquityBookkeeper(cfg.initial_equity)
     strat = InstrumentedHIP4Strategy(cfg, stale_book_ms=stale_book_ms)
@@ -1167,7 +1169,6 @@ async def run_paper_trading(
     tracked_markets: Dict[str, OutcomeMarket] = {}
     settled_market_ids: set[str] = set()
     traded_market_ids: set[str] = set()
-    subscribed_coins: set[str] = set()
     latest_books: Dict[str, Tuple[List[Tuple[float, float]], List[Tuple[float, float]], float]] = {}
     mark_history: List[Tuple[float, float]] = []
     latest_mark_px: Optional[float] = None
@@ -1312,7 +1313,6 @@ async def run_paper_trading(
                 continue
             twap = compute_strict_twap(mark_history, m.expiry_ts - 60.0, m.expiry_ts)
             if twap is None:
-                # TWAP 尚不可用时不丢弃持仓，留在 open_positions 供后续重试或退出时导出
                 continue
 
             pre_exp = [px for t, px in mark_history if t < m.expiry_ts]
@@ -1345,7 +1345,6 @@ async def run_paper_trading(
                 payout = orow["filled_shares"] * (1.0 - pos["eff_settle_fee"]) if won else 0.0
                 pnl = payout - float(orow["cost_usdc"])
 
-                # 结算只加 payout_usdc，不再重复扣减 cost_usdc
                 eq_after_payout, peak_after_payout, _ = bookkeeper.apply_payout(payout)
                 strat.sync_drawdown_state(eq_after_payout, peak_after_payout)
 
@@ -1400,127 +1399,101 @@ async def run_paper_trading(
         write_csv_snapshot(out_dir / "paper_open_positions.csv", OPEN_POS_FIELDS, rows)
         return rows
 
+    def handle_markets(markets: List[OutcomeMarket], _newly_subscribed: List[OutcomeMarket]):
+        for m in markets:
+            tracked_markets[m.outcome_id] = m
+
+    def handle_mark(ev: MarkEvent):
+        nonlocal latest_mark_px, ann_vol
+        latest_mark_px = ev.mark_px
+        mark_history.append((ev.recv_ts, ev.mark_px))
+        ann_vol = vol_est.update(ev.recv_ts, ev.mark_px)
+
+    def handle_book(ev: BookEvent):
+        nonlocal order_seq
+        oid = ev.outcome_id
+        # 与现码一致：REST 补快照仅刷新盘口缓存，不直接触发策略下单
+        if ev.source == "rest":
+            latest_books[oid] = (ev.bids, ev.asks, ev.recv_ts)
+            return
+
+        t_now = ev.recv_ts
+        # 保留既有 paper 内存盘口时间约定：有交易所时间时取 min(exchange_ts, recv_ts)
+        book_ts = min(ev.exchange_ts, t_now) if ev.exchange_ts is not None else t_now
+        latest_books[oid] = (ev.bids, ev.asks, book_ts)
+
+        market = tracked_markets.get(oid)
+        if not market or latest_mark_px is None or oid in settled_market_ids or stop_requested:
+            return
+
+        twap_start = market.expiry_ts - 60.0
+        acc_twap = (
+            compute_strict_twap(mark_history, twap_start, t_now)
+            if t_now > twap_start
+            else None
+        )
+        dec = strat.evaluate_with_audit(
+            market, t_now, latest_mark_px, ann_vol, ev.bids, ev.asks, book_ts,
+            acc_twap, bookkeeper.equity, bookkeeper.peak_equity,
+        )
+        if dec.should_trade and t_now < reject_cooldown_until.get(oid, 0.0):
+            dec.should_trade = False
+            dec.filter_reason = "REJECT_COOLDOWN"
+
+        trig = sampler.check_trigger(dec)
+        if trig is not None:
+            decision_logger.append(decision_to_row(run_id, market, dec, trig))
+            decision_counts[dec.filter_reason] = decision_counts.get(dec.filter_reason, 0) + 1
+
+        if dec.should_trade:
+            order_seq += 1
+            strat.in_flight_markets.add(oid)
+            sig_q = extract_side_quote(dec.side, ev.bids, ev.asks)
+            task = asyncio.create_task(execute_delayed_order(order_seq, market, dec, sig_q))
+            pending_order_tasks.add(task)
+            task.add_done_callback(pending_order_tasks.discard)
+
+    def handle_tick(_now: float):
+        check_settlements()
+
+    def handle_disconnect(exc: Exception):
+        print(f"[Paper] WS 异常 ({exc})，3 秒后重连...")
+
+    feed = LiveMarketFeed(
+        network=network,
+        underlying=underlying,
+        period=period,
+        ws_url=ws_url,
+        poll_meta_sec=poll_meta_sec,
+        ping_interval_sec=25.0,
+        recv_timeout_sec=1.0,
+        reconnect_delay_sec=3.0,
+        tape_writer=tape_writer,
+        auto_settle_tape=True,
+        fetch_markets_fn=fetch_outcome_markets,
+        fetch_l2_book_fn=fetch_l2_book_rest,
+        parse_book_fn=parse_book_levels,
+        compute_twap_fn=compute_strict_twap,
+    )
+
     print(
         f"[Paper] RunID={run_id} | {network} {underlying} {period} | "
-        f"Bookkeeping={bookkeeper.source} | Output={out_dir.resolve()}"
+        f"Bookkeeping={bookkeeper.source} | DB={db_path} | Output={out_dir.resolve()}"
     )
 
     try:
-        while (not stop_requested) and (time.time() < stop_ts):
-            try:
-                async with websockets.connect(ws_url, ping_interval=None, max_size=4 * 1024 * 1024) as ws:
-                    subscribed_coins.clear()
-                    await ws.send(json.dumps({
-                        "method": "subscribe",
-                        "subscription": {"type": "activeAssetCtx", "coin": underlying},
-                    }))
-                    await ws.send(json.dumps({
-                        "method": "subscribe",
-                        "subscription": {"type": "outcomeMetaUpdates"},
-                    }))
-
-                    async def sync_markets():
-                        markets = await asyncio.to_thread(fetch_outcome_markets, network, period, underlying, True)
-                        for m in markets:
-                            tracked_markets[m.outcome_id] = m
-                            if m.yes_coin not in subscribed_coins:
-                                await ws.send(json.dumps({
-                                    "method": "subscribe",
-                                    "subscription": {"type": "l2Book", "coin": m.yes_coin},
-                                }))
-                                subscribed_coins.add(m.yes_coin)
-                                snap = await asyncio.to_thread(fetch_l2_book_rest, network, m.yes_coin)
-                                if snap and "levels" in snap:
-                                    b, a = parse_book_levels(snap)
-                                    latest_books[m.outcome_id] = (b, a, time.time())
-
-                    await sync_markets()
-                    last_meta_sync = time.time()
-                    last_ping = time.time()
-
-                    while (not stop_requested) and (time.time() < stop_ts):
-                        now = time.time()
-                        if now - last_ping >= 25.0:
-                            await ws.send(json.dumps({"method": "ping"}))
-                            last_ping = now
-                        if now - last_meta_sync >= poll_meta_sec:
-                            await sync_markets()
-                            check_settlements()
-                            last_meta_sync = now
-
-                        try:
-                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            check_settlements()
-                            continue
-
-                        msg = json.loads(raw_msg)
-                        channel = msg.get("channel")
-                        data = msg.get("data")
-
-                        if channel == "activeAssetCtx" and isinstance(data, dict):
-                            mpx_str = data.get("ctx", {}).get("markPx")
-                            if mpx_str is not None and str(data.get("coin", underlying)).upper() == underlying:
-                                t_now = time.time()
-                                latest_mark_px = float(mpx_str)
-                                mark_history.append((t_now, latest_mark_px))
-                                ann_vol = vol_est.update(t_now, latest_mark_px)
-
-                        elif channel == "l2Book" and isinstance(data, dict):
-                            coin_str = str(data.get("coin", ""))
-                            if coin_str.startswith("#") and coin_str.endswith("0"):
-                                oid = coin_str[1:-1]
-                                b, a = parse_book_levels(data)
-                                t_now = time.time()
-                                book_ts = (float(data["time"]) / 1000.0) if "time" in data else t_now
-                                book_ts = min(book_ts, t_now)
-                                latest_books[oid] = (b, a, book_ts)
-
-                                market = tracked_markets.get(oid)
-                                if not market or latest_mark_px is None or oid in settled_market_ids or stop_requested:
-                                    continue
-
-                                twap_start = market.expiry_ts - 60.0
-                                acc_twap = (
-                                    compute_strict_twap(mark_history, twap_start, t_now)
-                                    if t_now > twap_start
-                                    else None
-                                )
-                                dec = strat.evaluate_with_audit(
-                                    market, t_now, latest_mark_px, ann_vol, b, a, book_ts,
-                                    acc_twap, bookkeeper.equity, bookkeeper.peak_equity,
-                                )
-                                if dec.should_trade and t_now < reject_cooldown_until.get(oid, 0.0):
-                                    dec.should_trade = False
-                                    dec.filter_reason = "REJECT_COOLDOWN"
-
-                                trig = sampler.check_trigger(dec)
-                                if trig is not None:
-                                    decision_logger.append(decision_to_row(run_id, market, dec, trig))
-                                    decision_counts[dec.filter_reason] = decision_counts.get(dec.filter_reason, 0) + 1
-
-                                if dec.should_trade:
-                                    order_seq += 1
-                                    strat.in_flight_markets.add(oid)
-                                    sig_q = extract_side_quote(dec.side, b, a)
-                                    task = asyncio.create_task(execute_delayed_order(order_seq, market, dec, sig_q))
-                                    pending_order_tasks.add(task)
-                                    task.add_done_callback(pending_order_tasks.discard)
-
-                        elif channel == "outcomeMetaUpdates":
-                            await sync_markets()
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                stop_requested = True
-                break
-            except Exception as exc:
-                if stop_requested:
-                    break
-                print(f"[Paper] WS 异常 ({exc})，3 秒后重连...")
-                await asyncio.sleep(3.0)
+        await feed.run(
+            stop_ts=stop_ts,
+            should_stop=lambda: stop_requested,
+            on_markets=handle_markets,
+            on_mark=handle_mark,
+            on_book=handle_book,
+            on_tick=handle_tick,
+            on_disconnect=handle_disconnect,
+        )
     except (KeyboardInterrupt, asyncio.CancelledError):
         stop_requested = True
     finally:
-        # 恢复原 SIGINT 处理器
         try:
             signal.signal(signal.SIGINT, prev_sigint_handler)
         except Exception:
@@ -1538,8 +1511,10 @@ async def run_paper_trading(
             except asyncio.TimeoutError:
                 print(f"[Paper] 警告: 等待在途延迟单超时 ({drain_timeout:.1f}s)，继续执行结算收尾。")
 
-        # 2) 再做一次到期结算
+        # 2) 再做一次到期结算，并同步落盘 SQLite 磁带结算结果
         check_settlements()
+        tape_writer.settle_expired_markets(compute_strict_twap)
+        tape_writer.close()
 
         # 3) 将仍未到期或 TWAP 尚未出来的持仓写入 paper_open_positions.csv
         end_ts = time.time()
@@ -1565,10 +1540,13 @@ async def run_paper_trading(
             "decision_sample_sec": decision_sample_sec,
             "near_edge_margin": near_edge_margin,
             "duration_min_target": duration_min,
+            "db_path": db_path,
         }
+        resolved_db = db_path if db_path == ":memory:" else str(Path(db_path).resolve())
         write_summary_and_metadata(
             out_dir, "paper_summary.json", run_id, "paper", network, underlying, period,
             start_ts, end_ts, cfg, exec_params, bookkeeper, extra_metrics,
+            db_path=resolved_db,
         )
         order_logger.close()
         settle_logger.close()
@@ -1983,6 +1961,11 @@ def main():
     p_paper.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet")
     p_paper.add_argument("--underlying", default="BTC")
     p_paper.add_argument("--period", default="15m")
+    p_paper.add_argument(
+        "--db",
+        default="hip4_replay.sqlite",
+        help="同步录制行情磁带的 SQLite 路径（默认 hip4_replay.sqlite）；不要与 record 同时并发写同一文件",
+    )
     p_paper.add_argument("--minutes", type=float, default=120.0)
     add_common_args(p_paper, default_out_dir="paper_logs")
 
@@ -2010,6 +1993,7 @@ def main():
                 out_root_arg=args.out_root,
                 subdir_by_run_id=args.subdir_by_run_id,
                 duration_min=args.minutes,
+                db_path=args.db,
             )
         )
     elif args.cmd == "export-backtest":

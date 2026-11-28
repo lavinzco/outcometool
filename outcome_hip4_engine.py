@@ -11,8 +11,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
-import websockets
 from scipy.stats import norm, t as student_t
+
+from market_data import LiveMarketFeed, MarketTapeWriter, init_db
 
 
 # ============================================================
@@ -438,46 +439,6 @@ def simulate_clob_buy_fill(
 # 3. SQLite 影子录制层（L2 盘口 + HyperCore markPx + 自动 TWAP 结算）
 # ============================================================
 
-def init_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS markets (
-            outcome_id TEXT PRIMARY KEY,
-            name TEXT,
-            underlying TEXT,
-            strike REAL,
-            expiry_ts REAL,
-            period TEXT,
-            fee_scale REAL,
-            yes_coin TEXT,
-            raw_description TEXT,
-            settled_twap REAL,
-            outcome_up INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS book_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL NOT NULL,
-            outcome_id TEXT NOT NULL,
-            bids_json TEXT NOT NULL,
-            asks_json TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_book_oid_ts ON book_snapshots(outcome_id, ts);
-
-        CREATE TABLE IF NOT EXISTS mark_ticks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL NOT NULL,
-            underlying TEXT NOT NULL,
-            mark_px REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_mark_u_ts ON mark_ticks(underlying, ts);
-        """
-    )
-    conn.commit()
-    return conn
-
-
 def compute_strict_twap(
     ticks: List[Tuple[float, float]],
     window_start: float,
@@ -531,168 +492,64 @@ async def record_live_data(
     poll_meta_sec: float = 20.0,
 ):
     """
-    异步录制器：
-    1) 自动发现活跃的 class:priceBinary 市场并写入 SQLite
-    2) 订阅 HyperCore 永续 activeAssetCtx (markPx) 与目标盘口 l2Book (#outcomeId0)
-    3) 断线自动重连，重连后立即 REST 补拉 l2Book 快照防止丢状态
+    异步录制器（通过共享采集层 market_data.LiveMarketFeed 驱动）：
+    1) 自动发现活跃的二元价格盘并写入 SQLite
+    2) 订阅 HyperCore 永续 activeAssetCtx (markPx) 与目标盘口 Yes 侧 l2Book (#outcomeId0)
+    3) 断线自动重连，首次订阅与重连后立即 REST 补拉 l2Book 快照
     4) 到期后自动按 [expiry-60s, expiry) 严格计算 markPx TWAP 写入结算结果
     """
-    conn = init_db(db_path)
-    ws_url = ENDPOINTS[network]["ws"]
     stop_ts = time.time() + duration_min * 60.0
     underlying = underlying.upper()
+    writer = MarketTapeWriter(db_path)
 
-    tracked_markets: Dict[str, OutcomeMarket] = {}
-    subscribed_coins: set[str] = set()
+    def handle_markets(_markets, newly_subscribed):
+        for m in newly_subscribed:
+            print(
+                f"[Recorder] 已订阅 {m.yes_coin} | Strike={m.strike} | "
+                f"Expiry={datetime.fromtimestamp(m.expiry_ts, tz=timezone.utc).strftime('%H:%M UTC')} | "
+                f"feeScale={m.fee_scale}"
+            )
 
-    def upsert_market(m: OutcomeMarket):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO markets
-            (outcome_id, name, underlying, strike, expiry_ts, period, fee_scale, yes_coin, raw_description)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                m.outcome_id, m.name, m.underlying, m.strike, m.expiry_ts,
-                m.period, m.fee_scale, m.yes_coin, m.raw_description,
-            ),
-        )
-        conn.commit()
+    def handle_settled(settled_rows):
+        for oid, u_sym, strike, twap, outcome_up in settled_rows:
+            print(
+                f"[Settle] Market #{oid} ({u_sym}) | Strike={strike:.2f} | "
+                f"60s TWAP={twap:.4f} -> {'UP (Yes)' if outcome_up == 1 else 'DOWN (No)'}"
+            )
 
-    def settle_expired_markets():
-        now = time.time()
-        rows = conn.execute(
-            "SELECT outcome_id, underlying, strike, expiry_ts FROM markets WHERE outcome_up IS NULL AND expiry_ts <= ?",
-            (now - 2.0,),
-        ).fetchall()
-        for oid, u_sym, strike, expiry_ts in rows:
-            t_rows = conn.execute(
-                "SELECT ts, mark_px FROM mark_ticks WHERE underlying = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC",
-                (u_sym, expiry_ts - 120.0, expiry_ts + 2.0),
-            ).fetchall()
-            twap = compute_strict_twap(t_rows, expiry_ts - 60.0, expiry_ts)
-            if twap is not None:
-                # 严格高于 strike 结算 UP (1)，等于或低于结算 DOWN (0)
-                outcome_up = 1 if twap > strike else 0
-                conn.execute(
-                    "UPDATE markets SET settled_twap = ?, outcome_up = ? WHERE outcome_id = ?",
-                    (twap, outcome_up, oid),
-                )
-                conn.commit()
-                print(
-                    f"[Settle] Market #{oid} ({u_sym}) | Strike={strike:.2f} | "
-                    f"60s TWAP={twap:.4f} -> {'UP (Yes)' if outcome_up == 1 else 'DOWN (No)'}"
-                )
+    def handle_disconnect(exc: Exception):
+        print(f"[Recorder] WS 断开或异常 ({exc})，3 秒后重连并补拉盘口快照...")
+
+    feed = LiveMarketFeed(
+        network=network,
+        underlying=underlying,
+        period=period,
+        ws_url=ENDPOINTS[network]["ws"],
+        poll_meta_sec=poll_meta_sec,
+        ping_interval_sec=25.0,
+        recv_timeout_sec=5.0,
+        reconnect_delay_sec=3.0,
+        tape_writer=writer,
+        auto_settle_tape=True,
+        fetch_markets_fn=fetch_outcome_markets,
+        fetch_l2_book_fn=fetch_l2_book_rest,
+        parse_book_fn=parse_book_levels,
+        compute_twap_fn=compute_strict_twap,
+    )
 
     print(f"[Recorder] 启动录制 ({network}) | underlying={underlying} | period={period} | DB={db_path}")
-
-    while time.time() < stop_ts:
-        try:
-            async with websockets.connect(ws_url, ping_interval=None, max_size=4 * 1024 * 1024) as ws:
-                subscribed_coins.clear()
-                # 订阅 HyperCore 永续实时 markPx 与 outcomeMetaUpdates
-                await ws.send(json.dumps({
-                    "method": "subscribe",
-                    "subscription": {"type": "activeAssetCtx", "coin": underlying},
-                }))
-                await ws.send(json.dumps({
-                    "method": "subscribe",
-                    "subscription": {"type": "outcomeMetaUpdates"},
-                }))
-
-                async def sync_markets_and_subscribe():
-                    markets = await asyncio.to_thread(
-                        fetch_outcome_markets, network, period, underlying, True
-                    )
-                    for m in markets:
-                        tracked_markets[m.outcome_id] = m
-                        upsert_market(m)
-                        if m.yes_coin not in subscribed_coins:
-                            await ws.send(json.dumps({
-                                "method": "subscribe",
-                                "subscription": {"type": "l2Book", "coin": m.yes_coin},
-                            }))
-                            subscribed_coins.add(m.yes_coin)
-                            # 重连/首次订阅立即 REST 补拉一次完整快照，避免丢盘口状态
-                            snap = await asyncio.to_thread(fetch_l2_book_rest, network, m.yes_coin)
-                            if snap and "levels" in snap:
-                                bids, asks = parse_book_levels(snap)
-                                conn.execute(
-                                    "INSERT INTO book_snapshots (ts, outcome_id, bids_json, asks_json) VALUES (?, ?, ?, ?)",
-                                    (time.time(), m.outcome_id, json.dumps(bids[:10]), json.dumps(asks[:10])),
-                                )
-                                conn.commit()
-                            print(
-                                f"[Recorder] 已订阅 {m.yes_coin} | Strike={m.strike} | "
-                                f"Expiry={datetime.fromtimestamp(m.expiry_ts, tz=timezone.utc).strftime('%H:%M UTC')} | "
-                                f"feeScale={m.fee_scale}"
-                            )
-
-                await sync_markets_and_subscribe()
-                last_meta_sync = time.time()
-                last_ping = time.time()
-                pending_writes = 0
-
-                while time.time() < stop_ts:
-                    now = time.time()
-                    if now - last_ping >= 25.0:
-                        await ws.send(json.dumps({"method": "ping"}))
-                        last_ping = now
-
-                    if now - last_meta_sync >= poll_meta_sec:
-                        await sync_markets_and_subscribe()
-                        settle_expired_markets()
-                        last_meta_sync = now
-
-                    try:
-                        raw_msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        continue
-
-                    msg = json.loads(raw_msg)
-                    channel = msg.get("channel")
-                    data = msg.get("data")
-
-                    if channel == "activeAssetCtx" and isinstance(data, dict):
-                        ctx = data.get("ctx", {})
-                        mark_px_str = ctx.get("markPx")
-                        coin_name = str(data.get("coin", underlying)).upper()
-                        if mark_px_str is not None and coin_name == underlying:
-                            conn.execute(
-                                "INSERT INTO mark_ticks (ts, underlying, mark_px) VALUES (?, ?, ?)",
-                                (time.time(), underlying, float(mark_px_str)),
-                            )
-                            pending_writes += 1
-
-                    elif channel == "l2Book" and isinstance(data, dict):
-                        coin_str = str(data.get("coin", ""))
-                        if coin_str.startswith("#") and coin_str.endswith("0"):
-                            oid = coin_str[1:-1]
-                            bids, asks = parse_book_levels(data)
-                            ts_val = (float(data["time"]) / 1000.0) if "time" in data else time.time()
-                            conn.execute(
-                                "INSERT INTO book_snapshots (ts, outcome_id, bids_json, asks_json) VALUES (?, ?, ?, ?)",
-                                (ts_val, oid, json.dumps(bids[:10]), json.dumps(asks[:10])),
-                            )
-                            pending_writes += 1
-
-                    elif channel == "outcomeMetaUpdates":
-                        await sync_markets_and_subscribe()
-
-                    if pending_writes >= 20:
-                        conn.commit()
-                        pending_writes = 0
-
-                if pending_writes > 0:
-                    conn.commit()
-        except Exception as exc:
-            print(f"[Recorder] WS 断开或异常 ({exc})，3 秒后重连并补拉盘口快照...")
-            conn.commit()
-            await asyncio.sleep(3.0)
-
-    settle_expired_markets()
-    conn.close()
-    print("[Recorder] 录制结束。")
+    try:
+        await feed.run(
+            stop_ts=stop_ts,
+            on_markets=handle_markets,
+            on_settled=handle_settled,
+            on_disconnect=handle_disconnect,
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        writer.close()
+        print("[Recorder] 录制结束。")
 
 
 # ============================================================
@@ -1094,7 +951,11 @@ def main():
     p_rec.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet")
     p_rec.add_argument("--underlying", default="BTC")
     p_rec.add_argument("--period", default="15m")
-    p_rec.add_argument("--db", default="hip4_replay.sqlite")
+    p_rec.add_argument(
+        "--db",
+        default="hip4_replay.sqlite",
+        help="行情磁带 SQLite 路径（默认 hip4_replay.sqlite）；不要与 paper 同时并发写同一文件",
+    )
     p_rec.add_argument("--minutes", type=float, default=65.0, help="连续录制时长（分钟）")
 
     p_bt = sub.add_parser("backtest", help="基于录制的真实盘口跑延迟滑点回测")

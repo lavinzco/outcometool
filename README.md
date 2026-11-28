@@ -19,12 +19,14 @@ python -m unittest test_paper_export.py test_outcome_review.py
 # 查看命令说明（启动时会 import 同目录的引擎）
 python outcome_paper_export.py -h
 
-# 实时纸面模拟，默认连 mainnet 行情，仍不下真单。默认标的 BTC、周期 15m。
-python outcome_paper_export.py paper --minutes 120 --out-dir paper_logs
+# 实时纸面模拟，默认连 mainnet 行情，仍不下真单。默认标的 BTC、周期 15m，并同步写 SQLite 磁带。
+python outcome_paper_export.py paper --minutes 120 --out-dir paper_logs --db hip4_replay.sqlite
 
 # 从 SQLite 历史回放导出成交、拒单、校准表
 python outcome_paper_export.py export-backtest --db hip4_replay.sqlite --out-dir bt_exports
 ```
+
+`paper` 会把同一份行情磁带写入 `--db`（默认 `hip4_replay.sqlite`，与 `record` 同结构），纸面结束后可直接拿这份 SQLite 换参数跑 `export-backtest`，不必为同一时段另开 `record`。不要对同一个 SQLite 文件同时并发运行 `record` 和 `paper`；需要可回放纸面时只跑 `paper --db ...` 即可。
 
 `--settlement-fee` 默认 `0.0007`，只是可配参数，不是已核实的官方费率。这个工具只做纸面模拟，不下真单。
 
