@@ -1,0 +1,141 @@
+{
+  "recorded_from": "POST https://api.hyperliquid.xyz/info {\"type\":\"outcomeMeta\"} and POST https://o1.outcome.xyz/api/v1/markets/lookup on 2026-11-28",
+  "hip4_binaryPrice_template": "Settlement is according to the {seconds}-second TWAP of {priceDescription} price ending at {time}.",
+  "outcomes": [
+    {
+      "label": "outcome_btc_15m_seconds_60",
+      "metadata_period": "15m",
+      "metadata_category": "out-btc-15m",
+      "outcome": {
+        "outcome": 50678,
+        "name": "template:binaryPrice",
+        "description": "perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:59402|time:20261128-1030",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "out",
+        "deployerFeeScale": "1.0"
+      }
+    },
+    {
+      "label": "outcome_btc_15m_previous_window_seconds_60",
+      "metadata_period": "15m",
+      "metadata_category": "out-btc-15m",
+      "outcome": {
+        "outcome": 50666,
+        "name": "template:binaryPrice",
+        "description": "perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:59565|time:20261128-1015",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "out",
+        "deployerFeeScale": "1.0"
+      }
+    },
+    {
+      "label": "outcome_eth_15m_seconds_60",
+      "metadata_period": "15m",
+      "metadata_category": "out-eth-15m",
+      "outcome": {
+        "outcome": 50676,
+        "name": "template:binaryPrice",
+        "description": "perp:ETH|priceDescription:ETH-USDC perp mark|seconds:60|threshold:1651.2|time:20261128-1030",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "out",
+        "deployerFeeScale": "1.0"
+      }
+    },
+    {
+      "label": "recurring_btc_1d",
+      "metadata_period": "24h",
+      "metadata_category": "-btc-24h",
+      "outcome": {
+        "outcome": 50457,
+        "name": "Recurring",
+        "description": "class:priceBinary|underlying:BTC|expiry:20261129-0600|targetPrice:59702|period:1d",
+        "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+        "quoteToken": "USDC"
+      }
+    },
+    {
+      "label": "outcome_ant_24h_seconds_60",
+      "metadata_period": "24h",
+      "metadata_category": "out-ant-24h",
+      "outcome": {
+        "outcome": 49984,
+        "name": "template:binaryPrice",
+        "description": "perp:xyz:ANT|priceDescription:xyz:ANT-USDC perp mark|seconds:60|threshold:91.74|time:20261128-2100",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "out",
+        "deployerFeeScale": "1.0"
+      }
+    },
+    {
+      "label": "fox_btc_15_minute_candle_seconds_1",
+      "metadata_period": null,
+      "metadata_category": null,
+      "outcome": {
+        "outcome": 50378,
+        "name": "template:binaryPrice",
+        "description": "perp:BTC|priceDescription:the Hyperliquid BTC perp 15-minute candle close reference|seconds:1|threshold:60000|time:20261128-0445",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "fox"
+      }
+    },
+    {
+      "label": "fox_btc_5_minute_candle_seconds_1",
+      "metadata_period": null,
+      "metadata_category": null,
+      "outcome": {
+        "outcome": 50681,
+        "name": "template:binaryPrice",
+        "description": "perp:BTC|priceDescription:the Hyperliquid BTC perp 5-minute candle close reference|seconds:1|threshold:59300|time:20261128-1030",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "fox"
+      }
+    },
+    {
+      "label": "fox_btc_1_hour_candle_seconds_1",
+      "metadata_period": null,
+      "metadata_category": null,
+      "outcome": {
+        "outcome": 50658,
+        "name": "template:binaryPrice",
+        "description": "perp:BTC|priceDescription:the Hyperliquid BTC perp 1-hour candle close reference|seconds:1|threshold:59500|time:20261128-1100",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "fox"
+      }
+    },
+    {
+      "label": "skew_btc_seconds_90",
+      "metadata_period": null,
+      "metadata_category": null,
+      "outcome": {
+        "outcome": 50566,
+        "name": "template:binaryPrice",
+        "description": "perp:BTC|priceDescription:the Hyperliquid BTC perp trade|seconds:90|threshold:59952|time:20261128-1200",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "skew",
+        "deployerFeeScale": "1.0"
+      }
+    },
+    {
+      "label": "outcome_btc_price_touch_seconds_3",
+      "metadata_period": null,
+      "metadata_category": null,
+      "outcome": {
+        "outcome": 31270,
+        "name": "template:priceTouch",
+        "description": "perp:BTC|priceDescription:BTC-USDC perp mark|seconds:3|target:80000|time:20261201-0000",
+        "sideSpecs": [{"name": "template:Yes"}, {"name": "template:No"}],
+        "quoteToken": "USDC",
+        "venue": "out",
+        "deployerFeeScale": "1.0"
+      }
+    }
+  ]
+}

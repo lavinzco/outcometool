@@ -84,8 +84,21 @@ class StrategyConfig:
 # 2. HyperCore HIP-4 元数据与订单簿解析器
 # ============================================================
 
+# Outcome 前端使用的市场查询。HIP-4 outcomeMeta 本身没有 template:binaryPrice 的周期字段。
+# 已核对：POST 这个地址，body {"outcome_ids":[...]}，返回 metadata.period / metadata.category。
+OUTCOME_MARKET_LOOKUP_URL = "https://o1.outcome.xyz/api/v1/markets/lookup"
+
+# outcome id -> metadata.period。None 表示查询成功但没有周期，避免每个轮询都再打一次。
+_outcome_period_cache: Dict[str, Optional[str]] = {}
+
+
 def parse_outcome_description(desc: str) -> Dict[str, str]:
-    """解析 class:priceBinary|underlying:BTC|expiry:20260503-0600|targetPrice:78213|period:15m"""
+    """解析用 | 分隔的 key:value。只按第一个冒号切开，值里可以再含冒号。
+
+    旧的协议盘：class:priceBinary|underlying:BTC|expiry:YYYYMMDD-HHMM|targetPrice:N|period:15m
+    部署盘：perp:BTC|priceDescription:...|seconds:60|threshold:N|time:YYYYMMDD-HHMM
+    seconds 会留在字典里，但它不是 period。
+    """
     parsed: Dict[str, str] = {}
     if not desc:
         return parsed
@@ -104,68 +117,101 @@ def parse_utc_expiry(expiry_str: str) -> Optional[float]:
         return None
 
 
-def fetch_outcome_markets(
-    network: str = "mainnet",
+def _price_binary_terms(item: dict, desc_meta: Dict[str, str]) -> Optional[Tuple[str, str, str]]:
+    """返回 (标的, 行权价文本, 到期文本)。不是二元价格盘则返回 None。
+
+    priceTouch / scalarPrice / priceBucket 不在这里面。
+    """
+    if desc_meta.get("class") == "priceBinary":
+        return (
+            desc_meta.get("underlying", ""),
+            desc_meta.get("targetPrice", ""),
+            desc_meta.get("expiry", ""),
+        )
+    if item.get("name") == "template:binaryPrice":
+        return (
+            desc_meta.get("perp", ""),
+            desc_meta.get("threshold", ""),
+            desc_meta.get("time", ""),
+        )
+    return None
+
+
+def contract_period(desc_meta: Dict[str, str], outcome_id: str, period_by_outcome_id: Optional[Dict[str, str]]) -> str:
+    """合约周期。不读取 seconds。
+
+    描述里的 period: 是 HIP-4 重复盘的周期（如 15m、1d），有它就用它。
+    template:binaryPrice 没有这个字段。周期只来自 Outcome lookup 的 metadata.period
+    （实盘 BTC 盘是 15m）。seconds 在 binaryPrice 模板里是结算 TWAP 的秒数。
+    """
+    explicit = (desc_meta.get("period") or "").strip()
+    if explicit:
+        return explicit
+    if not period_by_outcome_id:
+        return ""
+    raw = period_by_outcome_id.get(str(outcome_id))
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
+def select_outcome_markets(
+    outcomes: List[dict],
+    *,
     period: str = "15m",
     underlying: Optional[str] = None,
     only_active: bool = True,
+    now_ts: Optional[float] = None,
+    global_fee_scale: float = 1.0,
+    period_by_outcome_id: Optional[Dict[str, str]] = None,
 ) -> List[OutcomeMarket]:
-    """调用 POST /info {"type":"outcomeMeta"} 并精准筛选 class:priceBinary 盘口"""
-    url = ENDPOINTS[network]["rest"]
-    resp = requests.post(url, json={"type": "outcomeMeta"}, timeout=12)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    if isinstance(payload, dict):
-        outcomes = payload.get("outcomes", [])
-        global_fee_scale = float(payload.get("feeScale", 1.0) or 1.0)
-    elif isinstance(payload, list):
-        outcomes = payload
-        global_fee_scale = 1.0
-    else:
-        return []
-
-    now_ts = time.time()
+    """从 outcomeMeta 的 outcomes 里选出二元价格盘。period 为空表示不按周期过滤。"""
+    if now_ts is None:
+        now_ts = time.time()
+    want_period = (period or "").strip().lower()
+    want_underlying = underlying.upper() if underlying else ""
     results: List[OutcomeMarket] = []
 
     for item in outcomes:
+        if not isinstance(item, dict):
+            continue
         desc = item.get("description", "") or ""
-        meta = parse_outcome_description(desc)
-
-        # 严格过滤：只保留 priceBinary，绝不混入 priceBucket
-        if meta.get("class") != "priceBinary":
+        desc_meta = parse_outcome_description(desc)
+        terms = _price_binary_terms(item, desc_meta)
+        if terms is None:
             continue
-        if period and meta.get("period") != period:
-            continue
-
-        coin_underlying = meta.get("underlying", "").upper()
-        if underlying and coin_underlying != underlying.upper():
+        coin_underlying, strike_text, expiry_text = terms
+        coin_underlying = (coin_underlying or "").upper()
+        if want_underlying and coin_underlying != want_underlying:
             continue
 
-        expiry_ts = parse_utc_expiry(meta.get("expiry", ""))
+        expiry_ts = parse_utc_expiry(expiry_text or "")
         if expiry_ts is None:
             continue
         if only_active and expiry_ts <= now_ts:
             continue
 
         try:
-            strike = float(meta["targetPrice"])
             oid_str = str(item["outcome"])
             oid_int = int(oid_str)
+            strike = float(strike_text)
         except (KeyError, ValueError, TypeError):
+            continue
+
+        resolved_period = contract_period(desc_meta, oid_str, period_by_outcome_id)
+        if want_period and resolved_period.lower() != want_period:
             continue
 
         deployer_scale = item.get("deployerFeeScale")
         fee_scale = float(deployer_scale) if deployer_scale is not None else global_fee_scale
-
         results.append(
             OutcomeMarket(
                 outcome_id=oid_str,
-                name=str(item.get("name", f"{coin_underlying}-{period}-{oid_str}")),
+                name=str(item.get("name", f"{coin_underlying}-{resolved_period}-{oid_str}")),
                 underlying=coin_underlying,
                 strike=strike,
                 expiry_ts=expiry_ts,
-                period=meta.get("period", ""),
+                period=resolved_period,
                 fee_scale=fee_scale,
                 yes_coin=f"#{oid_str}0",
                 no_coin=f"#{oid_str}1",
@@ -175,7 +221,150 @@ def fetch_outcome_markets(
             )
         )
 
-    results.sort(key=lambda m: m.expiry_ts)
+    results.sort(key=lambda m: (m.expiry_ts, m.outcome_id))
+    return results
+
+
+def _template_binary_ids_for_lookup(outcomes: List[dict], underlying: Optional[str]) -> List[int]:
+    """没有 period: 的 template:binaryPrice，才需要向 Outcome 查 metadata.period。"""
+    want = underlying.upper() if underlying else ""
+    ids: List[int] = []
+    for item in outcomes:
+        if not isinstance(item, dict) or item.get("name") != "template:binaryPrice":
+            continue
+        desc_meta = parse_outcome_description(item.get("description", "") or "")
+        if (desc_meta.get("period") or "").strip():
+            continue
+        if want and (desc_meta.get("perp") or "").upper() != want:
+            continue
+        try:
+            ids.append(int(item["outcome"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ids
+
+
+def lookup_outcome_periods(outcome_ids: List[int], timeout: float = 12.0) -> Dict[str, Optional[str]]:
+    """向 Outcome lookup 取 metadata.period。
+
+    返回的值是周期字符串，或 None（这条盘在响应里，但没有 period）。
+    响应里没有的 id 不会出现在结果里。不读取描述中的 seconds。
+    """
+    found: Dict[str, Optional[str]] = {}
+    if not outcome_ids:
+        return found
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "outcometool",
+    }
+    for start in range(0, len(outcome_ids), 40):
+        chunk = [int(x) for x in outcome_ids[start:start + 40]]
+        resp = requests.post(
+            OUTCOME_MARKET_LOOKUP_URL,
+            json={"outcome_ids": chunk},
+            headers=headers,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict) or payload.get("success") is False:
+            raise ValueError("Outcome lookup 没有返回成功结果")
+        markets = (payload.get("data") or {}).get("markets") or {}
+        if not isinstance(markets, dict):
+            raise ValueError("Outcome lookup 的 markets 不是对象")
+        for key, row in markets.items():
+            if not isinstance(row, dict):
+                continue
+            metadata = row.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                found[str(key)] = None
+                continue
+            raw = metadata.get("period")
+            found[str(key)] = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    return found
+
+
+def fetch_outcome_markets(
+    network: str = "mainnet",
+    period: str = "15m",
+    underlying: Optional[str] = None,
+    only_active: bool = True,
+    now_ts: Optional[float] = None,
+) -> List[OutcomeMarket]:
+    """拉取 outcomeMeta，并按标的和合约周期筛选二元价格盘。
+
+    默认周期仍是 15m。template:binaryPrice 的 seconds 不参与周期判断。
+    """
+    url = ENDPOINTS[network]["rest"]
+    resp = requests.post(url, json={"type": "outcomeMeta"}, timeout=12)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    if isinstance(payload, dict):
+        outcomes = payload.get("outcomes", []) or []
+        global_fee_scale = float(payload.get("feeScale", 1.0) or 1.0)
+    elif isinstance(payload, list):
+        outcomes = payload
+        global_fee_scale = 1.0
+    else:
+        return []
+    if not isinstance(outcomes, list):
+        return []
+
+    if now_ts is None:
+        now_ts = time.time()
+
+    lookup_ids = _template_binary_ids_for_lookup(outcomes, underlying)
+    lookup_error = ""
+    missing = [oid for oid in lookup_ids if str(oid) not in _outcome_period_cache]
+    if missing:
+        try:
+            fresh = lookup_outcome_periods(missing)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            lookup_error = str(exc)
+            fresh = {}
+        for oid, value in fresh.items():
+            _outcome_period_cache[str(oid)] = value
+
+    period_by_outcome_id: Dict[str, str] = {}
+    for oid in lookup_ids:
+        cached = _outcome_period_cache.get(str(oid))
+        if isinstance(cached, str) and cached:
+            period_by_outcome_id[str(oid)] = cached
+
+    results = select_outcome_markets(
+        outcomes,
+        period=period,
+        underlying=underlying,
+        only_active=only_active,
+        now_ts=now_ts,
+        global_fee_scale=global_fee_scale,
+        period_by_outcome_id=period_by_outcome_id,
+    )
+    if lookup_error:
+        print(f"[Markets] Outcome metadata.period 查询失败，未标注周期的盘口没有入选：{lookup_error}")
+    if (period or "").strip() and not results:
+        seen = select_outcome_markets(
+            outcomes,
+            period="",
+            underlying=underlying,
+            only_active=only_active,
+            now_ts=now_ts,
+            global_fee_scale=global_fee_scale,
+            period_by_outcome_id=period_by_outcome_id,
+        )
+        counts: Dict[str, int] = {}
+        for market in seen:
+            label = market.period or "(无 period)"
+            counts[label] = counts.get(label, 0) + 1
+        count_text = ", ".join(f"{key}={counts[key]}" for key in sorted(counts)) or "无"
+        print(
+            f"[Markets] 没有匹配 underlying={underlying or '*'} period={period} 的活跃二元价格盘。"
+            f" 已识别周期: {count_text}。"
+            " template:binaryPrice 的 seconds 是结算 TWAP 秒数，不用作合约周期；"
+            " 没有 period: 时只采用 Outcome metadata.period。"
+        )
     return results
 
 
