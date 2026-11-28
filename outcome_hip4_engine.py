@@ -2,14 +2,13 @@ import argparse
 import asyncio
 import json
 import math
-import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import requests
 from scipy.stats import norm, t as student_t
 
@@ -30,6 +29,9 @@ ENDPOINTS = {
         "ws": "wss://api.hyperliquid-testnet.xyz/ws",
     },
 }
+
+# 拒单冷却时间（秒）：纸面与回放共用，不占用单场交易额度
+REJECT_COOLDOWN_SEC = 3.0
 
 
 @dataclass
@@ -388,31 +390,85 @@ def parse_book_levels(book_data: dict) -> Tuple[List[Tuple[float, float]], List[
     return bids, asks
 
 
-def simulate_clob_buy_fill(
+# ============================================================
+# 2.5 唯一逐档撮合与盘口报价工具（纸面与回放共用）
+# ============================================================
+
+@dataclass
+class SideQuote:
+    bid: Optional[float]
+    ask: Optional[float]
+    mid: Optional[float]
+    spread: Optional[float]
+    bid_sz: float
+    ask_sz: float
+
+
+@dataclass
+class DetailedFill:
+    filled_shares: int
+    vwap: float
+    cost_usdc: float
+    levels_consumed: int
+    worst_fill_px: float
+    top_ask_px: float
+    top_ask_usdc: float
+    total_avail_usdc: float
+    depth_covers_target: bool
+    fill_ratio: float
+
+
+def extract_side_quote(
+    side: str,
+    yes_bids: List[Tuple[float, float]],
+    yes_asks: List[Tuple[float, float]],
+) -> SideQuote:
+    """将 side 0 (Yes/UP) 合并订单簿映射为目标方向的标准买卖一与中间价。缺单边时对应价为 None。"""
+    if side == "UP":
+        bid = yes_bids[0][0] if yes_bids else None
+        bid_sz = yes_bids[0][1] if yes_bids else 0.0
+        ask = yes_asks[0][0] if yes_asks else None
+        ask_sz = yes_asks[0][1] if yes_asks else 0.0
+    else:
+        ask = round(1.0 - yes_bids[0][0], 5) if yes_bids else None
+        ask_sz = yes_bids[0][1] if yes_bids else 0.0
+        bid = round(1.0 - yes_asks[0][0], 5) if yes_asks else None
+        bid_sz = yes_asks[0][1] if yes_asks else 0.0
+
+    mid = round((bid + ask) / 2.0, 5) if (bid is not None and ask is not None) else None
+    spread = round(ask - bid, 5) if (bid is not None and ask is not None) else None
+    return SideQuote(bid=bid, ask=ask, mid=mid, spread=spread, bid_sz=bid_sz, ask_sz=ask_sz)
+
+
+def simulate_clob_buy_fill_detailed(
     side: str,
     target_usdc: float,
     yes_bids: List[Tuple[float, float]],
     yes_asks: List[Tuple[float, float]],
     min_notional: float = 1.0,
-) -> Optional[Tuple[int, float, float]]:
+) -> Optional[DetailedFill]:
     """
-    利用 HIP-4 合并镜像订单簿，按真实深度逐档吃单（整股约束 + 最小名义约束）。
+    唯一逐档吃单实现（整股约束 + 最小名义约束）：
     - 买 UP (Yes): 吃 side 0 asks，成交价 = px
     - 买 DOWN (No): 镜像吃 side 0 bids，成交价 = round(1 - px, 5)
-    返回: (filled_shares, vwap_price, total_cost_usdc)
     """
     if side == "UP":
-        ladder = [(px, sz) for px, sz in yes_asks if 0.0 < px < 1.0]
+        ladder = [(px, sz) for px, sz in yes_asks if 0.0 < px < 1.0 and sz > 0]
     else:
-        # yes_bids 已按 px 从高到低排列，因此 1 - px 天然按从低到高（最优卖一）排列
-        ladder = [(round(1.0 - px, 5), sz) for px, sz in yes_bids if 0.0 < px < 1.0]
+        ladder = [(round(1.0 - px, 5), sz) for px, sz in yes_bids if 0.0 < px < 1.0 and sz > 0]
 
     if not ladder:
         return None
 
+    total_avail_usdc = sum(px * math.floor(sz) for px, sz in ladder)
+    top_ask_px = ladder[0][0]
+    top_ask_usdc = top_ask_px * math.floor(ladder[0][1])
+
     remaining_usdc = target_usdc
     total_shares = 0
     total_cost = 0.0
+    levels_consumed = 0
+    worst_fill_px = top_ask_px
 
     for px, avail_sz in ladder:
         if px <= 0.0 or remaining_usdc < px:
@@ -425,6 +481,8 @@ def simulate_clob_buy_fill(
         total_shares += take_shares
         total_cost += cost
         remaining_usdc -= cost
+        levels_consumed += 1
+        worst_fill_px = px
         if remaining_usdc < px:
             break
 
@@ -432,11 +490,54 @@ def simulate_clob_buy_fill(
         return None
 
     vwap = total_cost / total_shares
-    return total_shares, vwap, total_cost
+    return DetailedFill(
+        filled_shares=total_shares,
+        vwap=vwap,
+        cost_usdc=total_cost,
+        levels_consumed=levels_consumed,
+        worst_fill_px=worst_fill_px,
+        top_ask_px=top_ask_px,
+        top_ask_usdc=top_ask_usdc,
+        total_avail_usdc=total_avail_usdc,
+        depth_covers_target=(total_avail_usdc >= target_usdc),
+        fill_ratio=(total_cost / target_usdc) if target_usdc > 0 else 0.0,
+    )
+
+
+def simulate_clob_buy_fill(
+    side: str,
+    target_usdc: float,
+    yes_bids: List[Tuple[float, float]],
+    yes_asks: List[Tuple[float, float]],
+    min_notional: float = 1.0,
+) -> Optional[Tuple[int, float, float]]:
+    """simulate_clob_buy_fill_detailed 的薄封装，返回 (filled_shares, vwap_price, total_cost_usdc)。"""
+    fill = simulate_clob_buy_fill_detailed(
+        side=side,
+        target_usdc=target_usdc,
+        yes_bids=yes_bids,
+        yes_asks=yes_asks,
+        min_notional=min_notional,
+    )
+    if fill is None:
+        return None
+    return fill.filled_shares, fill.vwap, fill.cost_usdc
+
+
+def decompose_slippage(fill_vwap: float, sig_q: SideQuote, exec_q: SideQuote) -> dict:
+    return {
+        "slip_vs_sig_mid": (fill_vwap - sig_q.mid) if sig_q.mid is not None else None,
+        "slip_vs_exec_mid": (fill_vwap - exec_q.mid) if exec_q.mid is not None else None,
+        "slip_vs_sig_ask": (fill_vwap - sig_q.ask) if sig_q.ask is not None else None,
+        "slip_book_walk": (fill_vwap - exec_q.ask) if exec_q.ask is not None else None,
+        "slip_latency_drift": (
+            (exec_q.ask - sig_q.ask) if (exec_q.ask is not None and sig_q.ask is not None) else None
+        ),
+    }
 
 
 # ============================================================
-# 3. SQLite 影子录制层（L2 盘口 + HyperCore markPx + 自动 TWAP 结算）
+# 3. SQLite 影子录制层（经由共享采集层 market_data 驱动）
 # ============================================================
 
 def compute_strict_twap(
@@ -495,7 +596,7 @@ async def record_live_data(
     异步录制器（通过共享采集层 market_data.LiveMarketFeed 驱动）：
     1) 自动发现活跃的二元价格盘并写入 SQLite
     2) 订阅 HyperCore 永续 activeAssetCtx (markPx) 与目标盘口 Yes 侧 l2Book (#outcomeId0)
-    3) 断线自动重连，首次订阅与重连后立即 REST 补拉 l2Book 快照
+    3) 断线自动重连，重连后立即 REST 补拉 l2Book 快照防止丢状态
     4) 到期后自动按 [expiry-60s, expiry) 严格计算 markPx TWAP 写入结算结果
     """
     stop_ts = time.time() + duration_min * 60.0
@@ -553,7 +654,7 @@ async def record_live_data(
 
 
 # ============================================================
-# 4. 策略核心：支持 60 秒 TWAP 亚式修正的厚尾二元定价器
+# 4. 策略核心：唯一 60 秒 TWAP 亚式厚尾二元定价与信号评价器
 # ============================================================
 
 class RollingMarkVol:
@@ -592,17 +693,72 @@ class RollingMarkVol:
         return max(0.65 * ann_fast + 0.35 * ann_slow, ann_slow * 0.9, self.min_ann_vol)
 
 
+@dataclass
+class EvaluationDecision:
+    should_trade: bool
+    filter_reason: str
+    outcome_id: str
+    ts: float
+    tau_sec: float
+    strike: float
+    mark_px: float
+    acc_twap: Optional[float]
+    ann_vol: float
+    p_up: float
+    p_up_normal: float
+    z_score: float
+    up_bid: Optional[float]
+    up_ask: Optional[float]
+    down_bid: Optional[float]
+    down_ask: Optional[float]
+    edge_up: Optional[float]
+    edge_down: Optional[float]
+    best_side: str
+    best_edge: Optional[float]
+    active_min_edge: float
+    gamma_penalty_applied: float
+    eff_settle_fee: float
+    book_age_ms: float
+    book_stale: bool
+    equity_at_signal: float
+    market_trades_used_before: int
+    kelly_full: Optional[float]
+    kelly_scaled: Optional[float]
+    target_risk_pct: Optional[float]
+    kelly_capped: Optional[bool]
+    target_usdc: Optional[float]
+    side: Optional[str] = None
+    fair_prob: Optional[float] = None
+    top_ask: Optional[float] = None
+    expected_edge: Optional[float] = None
+
+
 class HIP4AsianBinaryStrategy:
     """
-    针对 Outcome.xyz 60 秒 TWAP 结算机制定制的定价与信号引擎：
+    针对 Outcome.xyz 60 秒 TWAP 结算机制定制的唯一定价与信号引擎：
     - tau > 60s : 未来 60s 均值方差有效时间 tau_eff = tau - 40s
     - tau <= 60s: 结合已锁定 TWAP 计算剩余有效行权价 K_eff，剩余方差时间 tau_eff = tau / 3
+    - evaluate_with_audit / evaluate 只做评估，绝不在信号时增加 market_trades；
+      只有成交 (FILLED) 后才调用 record_fill(outcome_id) 占用单场额度。
     """
-    def __init__(self, cfg: StrategyConfig):
+    def __init__(self, cfg: StrategyConfig, stale_book_ms: float = 5000.0):
         self.cfg = cfg
+        self.stale_book_ms = stale_book_ms
         self.peak_equity = cfg.initial_equity
         self.halted = False
         self.market_trades: Dict[str, int] = {}
+        self.in_flight_markets: set[str] = set()
+
+    def sync_drawdown_state(self, equity: float, peak_equity: float):
+        self.peak_equity = max(self.peak_equity, peak_equity, equity)
+        if self.peak_equity > 0 and (self.peak_equity - equity) / self.peak_equity >= self.cfg.daily_drawdown_limit:
+            self.halted = True
+
+    def record_fill(self, outcome_id: str) -> int:
+        """仅在订单状态确认 FILLED 后调用，累加该场次已用额度。"""
+        used = self.market_trades.get(outcome_id, 0) + 1
+        self.market_trades[outcome_id] = used
+        return used
 
     def fair_prob_up_twap(
         self,
@@ -643,6 +799,188 @@ class HIP4AsianBinaryStrategy:
         p_norm = float(norm.cdf(z))
         return p_t, p_norm, z
 
+    def evaluate_with_audit(
+        self,
+        market: OutcomeMarket,
+        ts: float,
+        mark_px: float,
+        ann_vol: float,
+        yes_bids: List[Tuple[float, float]],
+        yes_asks: List[Tuple[float, float]],
+        book_ts: float,
+        acc_twap: Optional[float],
+        equity: float,
+        peak_equity: float,
+    ) -> EvaluationDecision:
+        """唯一信号评价实现（纸面与回放共用）。只读 market_trades，不修改额度。"""
+        self.sync_drawdown_state(equity, peak_equity)
+
+        tau_sec = market.expiry_ts - ts
+        p_up, p_up_norm, z = self.fair_prob_up_twap(mark_px, market.strike, tau_sec, ann_vol, acc_twap)
+        p_down = 1.0 - p_up
+
+        if tau_sec > 300.0:
+            base_edge = self.cfg.edge_early
+        elif tau_sec > 60.0:
+            base_edge = self.cfg.edge_mid
+        else:
+            base_edge = self.cfg.edge_twap_zone
+
+        gamma_pen = (
+            self.cfg.gamma_penalty
+            if (tau_sec <= self.cfg.gamma_zone_tau and abs(z) < self.cfg.gamma_zone_z)
+            else 0.0
+        )
+        active_min_edge = base_edge + gamma_pen
+        eff_settle_fee = self.cfg.settlement_fee_rate * market.fee_scale
+        net_payout = 1.0 - eff_settle_fee
+
+        up_q = extract_side_quote("UP", yes_bids, yes_asks)
+        down_q = extract_side_quote("DOWN", yes_bids, yes_asks)
+        edge_up = (p_up * net_payout - up_q.ask) if up_q.ask is not None else None
+        edge_down = (p_down * net_payout - down_q.ask) if down_q.ask is not None else None
+
+        best_side = ""
+        best_edge: Optional[float] = None
+        if edge_up is not None and (edge_down is None or edge_up >= edge_down):
+            best_side, best_edge = "UP", edge_up
+        elif edge_down is not None:
+            best_side, best_edge = "DOWN", edge_down
+
+        book_age_ms = max(0.0, (ts - book_ts) * 1000.0)
+        book_stale = book_age_ms > self.stale_book_ms
+        used_before = self.market_trades.get(market.outcome_id, 0)
+
+        def make_reject(
+            reason: str,
+            k_full: Optional[float] = None,
+            k_scaled: Optional[float] = None,
+            t_risk: Optional[float] = None,
+            k_cap: Optional[bool] = None,
+            t_usdc: Optional[float] = None,
+        ) -> EvaluationDecision:
+            return EvaluationDecision(
+                should_trade=False,
+                filter_reason=reason,
+                outcome_id=market.outcome_id,
+                ts=ts,
+                tau_sec=tau_sec,
+                strike=market.strike,
+                mark_px=mark_px,
+                acc_twap=acc_twap,
+                ann_vol=ann_vol,
+                p_up=p_up,
+                p_up_normal=p_up_norm,
+                z_score=z,
+                up_bid=up_q.bid,
+                up_ask=up_q.ask,
+                down_bid=down_q.bid,
+                down_ask=down_q.ask,
+                edge_up=edge_up,
+                edge_down=edge_down,
+                best_side=best_side,
+                best_edge=best_edge,
+                active_min_edge=active_min_edge,
+                gamma_penalty_applied=gamma_pen,
+                eff_settle_fee=eff_settle_fee,
+                book_age_ms=book_age_ms,
+                book_stale=book_stale,
+                equity_at_signal=equity,
+                market_trades_used_before=used_before,
+                kelly_full=k_full,
+                kelly_scaled=k_scaled,
+                target_risk_pct=t_risk,
+                kelly_capped=k_cap,
+                target_usdc=t_usdc,
+            )
+
+        if self.halted:
+            return make_reject("HALTED_DRAWDOWN")
+        if tau_sec < self.cfg.min_tau_sec:
+            return make_reject("TAU_TOO_SMALL")
+        if tau_sec > self.cfg.max_tau_sec:
+            return make_reject("TAU_TOO_LARGE")
+        if used_before >= self.cfg.max_trades_per_market:
+            return make_reject("MAX_TRADES_REACHED")
+        if market.outcome_id in self.in_flight_markets:
+            return make_reject("ORDER_IN_FLIGHT")
+        if not yes_bids and not yes_asks:
+            return make_reject("EMPTY_BOOK")
+
+        edge_pass = []
+        if edge_up is not None and edge_up > active_min_edge:
+            edge_pass.append(("UP", edge_up, up_q.ask, p_up))
+        if edge_down is not None and edge_down > active_min_edge:
+            edge_pass.append(("DOWN", edge_down, down_q.ask, p_down))
+
+        if not edge_pass:
+            return make_reject("EDGE_BELOW_THRESHOLD")
+
+        edge_pass.sort(key=lambda x: x[1], reverse=True)
+        band_pass = [
+            c for c in edge_pass
+            if c[2] is not None and (self.cfg.min_entry_price <= c[2] <= self.cfg.max_entry_price)
+        ]
+        if not band_pass:
+            return make_reject("PRICE_OUT_OF_BAND")
+
+        side, edge, top_ask, fair_p = band_pass[0]
+
+        kelly_full = edge / max(1e-6, (net_payout - top_ask))
+        kelly_scaled = self.cfg.kelly_fraction * kelly_full
+        kelly_capped = kelly_scaled > self.cfg.max_market_risk_pct
+        target_risk_pct = min(self.cfg.max_market_risk_pct, kelly_scaled)
+        target_usdc = round(max(0.0, equity) * target_risk_pct, 2)
+
+        if target_usdc < self.cfg.min_order_notional:
+            return make_reject(
+                "STAKE_TOO_SMALL",
+                k_full=kelly_full,
+                k_scaled=kelly_scaled,
+                t_risk=target_risk_pct,
+                k_cap=kelly_capped,
+                t_usdc=target_usdc,
+            )
+
+        return EvaluationDecision(
+            should_trade=True,
+            filter_reason="SIGNAL_TRIGGERED",
+            outcome_id=market.outcome_id,
+            ts=ts,
+            tau_sec=tau_sec,
+            strike=market.strike,
+            mark_px=mark_px,
+            acc_twap=acc_twap,
+            ann_vol=ann_vol,
+            p_up=p_up,
+            p_up_normal=p_up_norm,
+            z_score=z,
+            up_bid=up_q.bid,
+            up_ask=up_q.ask,
+            down_bid=down_q.bid,
+            down_ask=down_q.ask,
+            edge_up=edge_up,
+            edge_down=edge_down,
+            best_side=side,
+            best_edge=edge,
+            active_min_edge=active_min_edge,
+            gamma_penalty_applied=gamma_pen,
+            eff_settle_fee=eff_settle_fee,
+            book_age_ms=book_age_ms,
+            book_stale=book_stale,
+            equity_at_signal=equity,
+            market_trades_used_before=used_before,
+            kelly_full=kelly_full,
+            kelly_scaled=kelly_scaled,
+            target_risk_pct=target_risk_pct,
+            kelly_capped=kelly_capped,
+            target_usdc=target_usdc,
+            side=side,
+            fair_prob=fair_p,
+            top_ask=top_ask,
+            expected_edge=edge,
+        )
+
     def evaluate(
         self,
         market: OutcomeMarket,
@@ -653,263 +991,73 @@ class HIP4AsianBinaryStrategy:
         yes_asks: List[Tuple[float, float]],
         acc_twap: Optional[float],
         equity: float,
+        book_ts: Optional[float] = None,
+        peak_equity: Optional[float] = None,
     ) -> Optional[dict]:
-        self.peak_equity = max(self.peak_equity, equity)
-        if (self.peak_equity - equity) / self.peak_equity >= self.cfg.daily_drawdown_limit:
-            self.halted = True
-        if self.halted:
+        """evaluate_with_audit 的薄封装。只返回信号字典，不修改 market_trades。"""
+        dec = self.evaluate_with_audit(
+            market=market,
+            ts=ts,
+            mark_px=mark_px,
+            ann_vol=ann_vol,
+            yes_bids=yes_bids,
+            yes_asks=yes_asks,
+            book_ts=ts if book_ts is None else book_ts,
+            acc_twap=acc_twap,
+            equity=equity,
+            peak_equity=self.peak_equity if peak_equity is None else peak_equity,
+        )
+        if not dec.should_trade:
             return None
-
-        tau_sec = market.expiry_ts - ts
-        if not (self.cfg.min_tau_sec <= tau_sec <= self.cfg.max_tau_sec):
-            return None
-        if self.market_trades.get(market.outcome_id, 0) >= self.cfg.max_trades_per_market:
-            return None
-
-        if not yes_bids and not yes_asks:
-            return None
-
-        up_ask = yes_asks[0][0] if yes_asks else 1.0
-        down_ask = round(1.0 - yes_bids[0][0], 5) if yes_bids else 1.0
-
-        p_up, _, z = self.fair_prob_up_twap(mark_px, market.strike, tau_sec, ann_vol, acc_twap)
-        p_down = 1.0 - p_up
-
-        # 分段净优势门槛
-        if tau_sec > 300.0:
-            min_edge = self.cfg.edge_early
-        elif tau_sec > 60.0:
-            min_edge = self.cfg.edge_mid
-        else:
-            min_edge = self.cfg.edge_twap_zone
-
-        # Gamma 雷区惩罚
-        if tau_sec <= self.cfg.gamma_zone_tau and abs(z) < self.cfg.gamma_zone_z:
-            min_edge += self.cfg.gamma_penalty
-
-        # HIP-4 开仓 0 费率，但持有至结算扣除结算费（按 fee_scale 缩放）
-        eff_settle_fee = self.cfg.settlement_fee_rate * market.fee_scale
-        # 净期望收益：胜率 * (1 - 结算费) - 入场成本
-        edge_up = p_up * (1.0 - eff_settle_fee) - up_ask
-        edge_down = p_down * (1.0 - eff_settle_fee) - down_ask
-
-        side, edge, top_ask, fair_p = None, 0.0, 0.0, 0.0
-        if (
-            edge_up > min_edge
-            and edge_up >= edge_down
-            and self.cfg.min_entry_price <= up_ask <= self.cfg.max_entry_price
-        ):
-            side, edge, top_ask, fair_p = "UP", edge_up, up_ask, p_up
-        elif (
-            edge_down > min_edge
-            and self.cfg.min_entry_price <= down_ask <= self.cfg.max_entry_price
-        ):
-            side, edge, top_ask, fair_p = "DOWN", edge_down, down_ask, p_down
-
-        if side is None:
-            return None
-
-        # 分数凯利仓位（按净赔率计算）
-        net_payout = 1.0 - eff_settle_fee
-        kelly_f = edge / max(1e-6, (net_payout - top_ask))
-        risk_pct = min(self.cfg.max_market_risk_pct, self.cfg.kelly_fraction * kelly_f)
-        target_usdc = round(equity * risk_pct, 2)
-        if target_usdc < self.cfg.min_order_notional:
-            return None
-
-        self.market_trades[market.outcome_id] = self.market_trades.get(market.outcome_id, 0) + 1
         return {
             "outcome_id": market.outcome_id,
             "signal_ts": ts,
-            "side": side,
-            "fair_prob": fair_p,
-            "top_ask": top_ask,
-            "expected_edge": edge,
-            "target_usdc": target_usdc,
-            "tau_sec": tau_sec,
-            "z_score": z,
-            "eff_settle_fee": eff_settle_fee,
+            "side": dec.side,
+            "fair_prob": dec.fair_prob,
+            "top_ask": dec.top_ask,
+            "expected_edge": dec.expected_edge,
+            "target_usdc": dec.target_usdc,
+            "tau_sec": dec.tau_sec,
+            "z_score": dec.z_score,
+            "eff_settle_fee": dec.eff_settle_fee,
         }
 
 
 # ============================================================
-# 5. 延迟回放回测器（真实录制 L2 + markPx 重放）
+# 5. 统一回放入口（转调 export-backtest 同一路径，不再维护独立回测语义）
 # ============================================================
 
-def run_replay_backtest(db_path: str, cfg: StrategyConfig, latency_ms: int = 300):
-    conn = sqlite3.connect(db_path)
-    m_rows = conn.execute(
-        """
-        SELECT outcome_id, name, underlying, strike, expiry_ts, period,
-               fee_scale, yes_coin, raw_description, settled_twap, outcome_up
-        FROM markets
-        WHERE outcome_up IS NOT NULL
-        ORDER BY expiry_ts ASC
-        """
-    ).fetchall()
+def run_replay_backtest(
+    db_path: str,
+    cfg: StrategyConfig,
+    latency_ms: int = 300,
+    *,
+    max_slippage: float = 0.008,
+    stale_book_ms: float = 5000.0,
+    decision_sample_sec: float = 30.0,
+    near_edge_margin: float = 0.015,
+    out_dir: str = "bt_exports",
+    out_root: str = "",
+    subdir_by_run_id: bool = False,
+    network: str = "mainnet",
+) -> Optional[dict]:
+    """与 outcome_paper_export.py export-backtest 共用同一条回放、撮合与账本路径。"""
+    from outcome_paper_export import run_unified_replay_backtest
 
-    if not m_rows:
-        print("[Backtest] 数据库中没有已结算的完整场次，请先运行 record 录制至少 1 个完整窗口。")
-        conn.close()
-        return
-
-    strat = HIP4AsianBinaryStrategy(cfg)
-    vol_trackers: Dict[str, RollingMarkVol] = {}
-    equity = cfg.initial_equity
-    equity_curve = [equity]
-    trade_logs = []
-    calib_t, calib_norm, calib_y = [], [], []
-
-    latency_sec = latency_ms / 1000.0
-
-    for row in m_rows:
-        m = OutcomeMarket(
-            outcome_id=row[0], name=row[1], underlying=row[2], strike=row[3],
-            expiry_ts=row[4], period=row[5], fee_scale=row[6], yes_coin=row[7],
-            no_coin=f"#{row[0]}1",
-            yes_asset_id=100_000_000 + int(row[0]) * 10,
-            no_asset_id=100_000_000 + int(row[0]) * 10 + 1,
-            raw_description=row[8],
-        )
-        settled_twap, outcome_up = row[9], int(row[10])
-
-        vol_est = vol_trackers.setdefault(
-            m.underlying, RollingMarkVol(cfg.ewma_lambda, cfg.min_ann_vol)
-        )
-
-        # 读取该场次前后相关的 markPx 与 L2 快照
-        mark_rows = conn.execute(
-            "SELECT ts, mark_px FROM mark_ticks WHERE underlying = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC",
-            (m.underlying, m.expiry_ts - 1800.0, m.expiry_ts),
-        ).fetchall()
-        book_rows = conn.execute(
-            "SELECT ts, bids_json, asks_json FROM book_snapshots WHERE outcome_id = ? AND ts <= ? ORDER BY ts ASC",
-            (m.outcome_id, m.expiry_ts),
-        ).fetchall()
-
-        if not mark_rows or not book_rows:
-            continue
-
-        book_ts_arr = np.array([b[0] for b in book_rows], dtype=float)
-        twap_start = m.expiry_ts - 60.0
-        mark_idx = 0
-        latest_mark_px: Optional[float] = None
-        ann_vol = cfg.min_ann_vol
-        twap_buffer: List[Tuple[float, float]] = []
-        executed_orders: List[dict] = []
-
-        for b_idx, (bts, bids_s, asks_s) in enumerate(book_rows):
-            # 推进 markPx 至当前盘口时间
-            while mark_idx < len(mark_rows) and mark_rows[mark_idx][0] <= bts:
-                mts, mpx = mark_rows[mark_idx]
-                latest_mark_px = mpx
-                ann_vol = vol_est.update(mts, mpx)
-                if mts >= twap_start - 10.0:
-                    twap_buffer.append((mts, mpx))
-                mark_idx += 1
-
-            if latest_mark_px is None:
-                continue
-
-            tau_sec = m.expiry_ts - bts
-            acc_twap = (
-                compute_strict_twap(twap_buffer, twap_start, bts)
-                if bts > twap_start
-                else None
-            )
-
-            # 记录校准指标（每 5 秒采样一次避免高频盘口刷屏扭曲权重）
-            if b_idx % 5 == 0 and 10.0 <= tau_sec <= 860.0:
-                p_t, p_n, _ = strat.fair_prob_up_twap(
-                    latest_mark_px, m.strike, tau_sec, ann_vol, acc_twap
-                )
-                calib_t.append(p_t)
-                calib_norm.append(p_n)
-                calib_y.append(outcome_up)
-
-            yes_bids = json.loads(bids_s)
-            yes_asks = json.loads(asks_s)
-            sig = strat.evaluate(m, bts, latest_mark_px, ann_vol, yes_bids, yes_asks, acc_twap, equity)
-            if sig is None:
-                continue
-
-            # 注入真实执行延迟：取 t + latency_sec 时刻的盘口做逐档深度撮合
-            exec_target_ts = bts + latency_sec
-            exec_idx = int(np.searchsorted(book_ts_arr, exec_target_ts, side="left"))
-            if exec_idx >= len(book_rows):
-                exec_idx = len(book_rows) - 1
-
-            exec_ts, exec_bids_s, exec_asks_s = book_rows[exec_idx]
-            fill = simulate_clob_buy_fill(
-                side=sig["side"],
-                target_usdc=sig["target_usdc"],
-                yes_bids=json.loads(exec_bids_s),
-                yes_asks=json.loads(exec_asks_s),
-                min_notional=cfg.min_order_notional,
-            )
-            if fill is None:
-                continue
-
-            shares, vwap, cost_usdc = fill
-            # 延迟后如果滑点把优势全吃掉则放弃（模拟 IOC 限价保护）
-            max_limit_px = min(cfg.max_entry_price, sig["top_ask"] + 0.008)
-            if vwap > max_limit_px:
-                continue
-
-            executed_orders.append({
-                **sig,
-                "exec_ts": exec_ts,
-                "shares": shares,
-                "vwap": vwap,
-                "cost_usdc": cost_usdc,
-                "slippage": vwap - sig["top_ask"],
-            })
-
-        # 到期结算（开仓费=0，获胜兑付按 1 - eff_settle_fee 结算）
-        for od in executed_orders:
-            won = (od["side"] == "UP" and outcome_up == 1) or (od["side"] == "DOWN" and outcome_up == 0)
-            payout = od["shares"] * (1.0 - od["eff_settle_fee"]) if won else 0.0
-            pnl = payout - od["cost_usdc"]
-            equity += pnl
-            equity_curve.append(equity)
-            trade_logs.append({
-                "oid": m.outcome_id,
-                "side": od["side"],
-                "shares": od["shares"],
-                "vwap": round(od["vwap"], 4),
-                "slip": round(od["slippage"], 4),
-                "fair": round(od["fair_prob"], 3),
-                "tau_s": int(od["tau_sec"]),
-                "twap": round(settled_twap, 2),
-                "strike": round(m.strike, 2),
-                "won": won,
-                "pnl": round(pnl, 2),
-                "equity": round(equity, 2),
-            })
-
-    conn.close()
-
-    eq_arr = np.array(equity_curve)
-    max_dd = float(np.max((np.maximum.accumulate(eq_arr) - eq_arr) / np.maximum.accumulate(eq_arr)))
-
-    print("\n================ Outcome HIP-4 真实盘口回放报告 ================")
-    print(f"已结算回测场次数     : {len(m_rows)} | 模拟链路延迟: {latency_ms} ms")
-    if calib_t:
-        brier_t = float(np.mean((np.array(calib_t) - np.array(calib_y)) ** 2))
-        brier_n = float(np.mean((np.array(calib_norm) - np.array(calib_y)) ** 2))
-        print(f"TWAP 厚尾 Brier      : {brier_t:.5f} (正态基准: {brier_n:.5f}，越低越好)")
-    print(f"实际成交笔数         : {len(trade_logs)}")
-    if trade_logs:
-        tdf = pd.DataFrame(trade_logs)
-        ret_pct = (equity / cfg.initial_equity - 1.0) * 100.0
-        print(f"胜率                 : {tdf['won'].mean() * 100:.2f}%")
-        print(f"平均延迟滑点         : {tdf['slip'].mean():.5f}")
-        print(f"期末净值 / 收益率    : {equity:.2f} USDC ({ret_pct:+.2f}%)")
-        print(f"最大回撤 (MaxDD)     : {max_dd * 100:.2f}%")
-        print("\n交易回放明细：")
-        print(tdf.to_string(index=False))
-    else:
-        print("当前录制样本与延迟条件下无触发交易（可放宽 edge 阈值或延长录制周期）。")
+    ok, summary = run_unified_replay_backtest(
+        db_path=db_path,
+        cfg=cfg,
+        latency_ms=latency_ms,
+        max_slippage=max_slippage,
+        stale_book_ms=stale_book_ms,
+        decision_sample_sec=decision_sample_sec,
+        near_edge_margin=near_edge_margin,
+        out_dir_arg=out_dir,
+        out_root_arg=out_root,
+        subdir_by_run_id=subdir_by_run_id,
+        network=network,
+    )
+    return summary if ok else None
 
 
 # ============================================================
@@ -958,11 +1106,19 @@ def main():
     )
     p_rec.add_argument("--minutes", type=float, default=65.0, help="连续录制时长（分钟）")
 
-    p_bt = sub.add_parser("backtest", help="基于录制的真实盘口跑延迟滑点回测")
+    p_bt = sub.add_parser("backtest", help="转调与 export-backtest 相同的统一回放路径并导出摘要/CSV")
     p_bt.add_argument("--db", default="hip4_replay.sqlite")
+    p_bt.add_argument("--network", choices=["mainnet", "testnet"], default="mainnet")
     p_bt.add_argument("--latency-ms", type=int, default=300)
+    p_bt.add_argument("--max-slippage", type=float, default=0.008)
+    p_bt.add_argument("--stale-book-ms", type=float, default=5000.0)
     p_bt.add_argument("--equity", type=float, default=1000.0)
     p_bt.add_argument("--settlement-fee", type=float, default=0.0007)
+    p_bt.add_argument("--decision-sample-sec", type=float, default=30.0)
+    p_bt.add_argument("--near-edge-margin", type=float, default=0.015)
+    p_bt.add_argument("--out-dir", default="bt_exports")
+    p_bt.add_argument("--out-root", default="")
+    p_bt.add_argument("--subdir-by-run-id", action="store_true")
 
     args = parser.parse_args()
     if args.cmd == "discover":
@@ -971,7 +1127,21 @@ def main():
         asyncio.run(record_live_data(args.network, args.underlying, args.period, args.db, args.minutes))
     elif args.cmd == "backtest":
         cfg = StrategyConfig(initial_equity=args.equity, settlement_fee_rate=args.settlement_fee)
-        run_replay_backtest(args.db, cfg, latency_ms=args.latency_ms)
+        summary = run_replay_backtest(
+            args.db,
+            cfg,
+            latency_ms=args.latency_ms,
+            max_slippage=args.max_slippage,
+            stale_book_ms=args.stale_book_ms,
+            decision_sample_sec=args.decision_sample_sec,
+            near_edge_margin=args.near_edge_margin,
+            out_dir=args.out_dir,
+            out_root=args.out_root,
+            subdir_by_run_id=args.subdir_by_run_id,
+            network=args.network,
+        )
+        if summary is None:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
