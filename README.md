@@ -19,7 +19,7 @@ python -m unittest test_paper_export.py test_outcome_review.py
 # 查看命令说明（启动时会 import 同目录的引擎）
 python outcome_paper_export.py -h
 
-# 实时纸面模拟，默认连 mainnet 行情，仍不下真单
+# 实时纸面模拟，默认连 mainnet 行情，仍不下真单。默认标的 BTC、周期 15m。
 python outcome_paper_export.py paper --minutes 120 --out-dir paper_logs
 
 # 从 SQLite 历史回放导出成交、拒单、校准表
@@ -27,6 +27,8 @@ python outcome_paper_export.py export-backtest --db hip4_replay.sqlite --out-dir
 ```
 
 `--settlement-fee` 默认 `0.0007`，只是可配参数，不是已核实的官方费率。这个工具只做纸面模拟，不下真单。
+
+`discover`、`record` 和 `paper` 的默认 `--period` 仍是 `15m`。HIP-4 重复盘的周期在描述的 `period:` 里（例如 `1d`）。`template:binaryPrice` 没有这个字段；描述里的 `seconds` 是结算 TWAP 的秒数，不是合约周期。这类盘的周期用 Outcome lookup 返回的 `metadata.period`。查不到时不会拿 `seconds` 来顶替，15 分钟筛选就不会把这张盘算进去。
 
 默认仍直接写到 `--out-dir`。可选 `--out-root` 会写到该目录下的 run_id 子目录，`--subdir-by-run-id` 会在 `--out-dir` 下再按 run_id 分子目录。不传这两个参数时，`outcome_review.py` 原来的路径继续可用。
 
