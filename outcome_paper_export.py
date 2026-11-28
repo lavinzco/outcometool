@@ -38,8 +38,10 @@ from outcome_hip4_engine import (
     simulate_clob_buy_fill_detailed,
 )
 from paper_bookkeeping import (
+    DRAWDOWN_DEFINITION,
     apply_fill_equity,
     apply_payout_equity,
+    compute_settlement_shadow_equity,
     update_peak_dd,
 )
 
@@ -635,6 +637,7 @@ def write_summary_and_metadata(
         "return_pct": round((bookkeeper.equity / cfg.initial_equity - 1.0) * 100.0, 3) if cfg.initial_equity > 0 else 0.0,
         "max_drawdown_pct": round(bookkeeper.max_dd * 100.0, 3),
         "bookkeeping_source": bookkeeper.source,
+        "drawdown_definition": dict(DRAWDOWN_DEFINITION),
         "latency_ms": exec_params.get("latency_ms"),
         "max_slippage": exec_params.get("max_slippage"),
         "stale_book_ms": exec_params.get("stale_book_ms"),
@@ -813,7 +816,7 @@ async def run_paper_trading(
 
             # 成交立即扣减本金，刷新峰值与最大回撤，且只有 FILLED 才占用单场额度
             eq_after_fill, peak_after_fill, _ = bookkeeper.apply_fill(fill.cost_usdc)
-            strat.sync_drawdown_state(eq_after_fill, peak_after_fill)
+            strat.sync_drawdown_state(eq_after_fill, peak_after_fill, ts=exec_ts)
 
             row = build_order_row(
                 run_id, order_id, market, dec, sig_q, exec_ts, latency_ms,
@@ -882,7 +885,7 @@ async def run_paper_trading(
 
                 # 结算只加 payout_usdc，不再重复扣减 cost_usdc
                 eq_after_payout, peak_after_payout, _ = bookkeeper.apply_payout(payout)
-                strat.sync_drawdown_state(eq_after_payout, peak_after_payout)
+                strat.sync_drawdown_state(eq_after_payout, peak_after_payout, ts=now)
 
                 srow = build_settlement_row(
                     run_id, orow, now, twap, mark_exp, outcome_up, eq_after_payout, payout, pnl, won
@@ -1057,6 +1060,10 @@ async def run_paper_trading(
         open_rows = dump_open_positions(end_ts)
         open_cost_usdc = round(sum(float(r["cost_usdc"]) for r in open_rows), 4)
 
+        shadow_metrics = compute_settlement_shadow_equity(
+            cfg.initial_equity,
+            [float(r["equity_after"]) for r in settled_records],
+        )
         extra_metrics = {
             "settled_markets_total": len(settled_market_ids),
             "settled_trades": len(settled_records),
@@ -1068,6 +1075,8 @@ async def run_paper_trading(
             "order_status_breakdown": order_status_counts,
             "decision_sample_breakdown": decision_counts,
             "halted_by_drawdown": strat.halted,
+            **strat.halt_snapshot(),
+            **shadow_metrics,
         }
         exec_params = {
             "latency_ms": latency_ms,
@@ -1387,7 +1396,7 @@ def run_unified_replay_backtest(
 
                 # 成交立即扣减本金、刷新峰值与最大回撤，且只有 FILLED 才占用单场额度
                 eq_after_fill, peak_after_fill, _ = bookkeeper.apply_fill(fill.cost_usdc)
-                strat.sync_drawdown_state(eq_after_fill, peak_after_fill)
+                strat.sync_drawdown_state(eq_after_fill, peak_after_fill, ts=exec_target_ts)
 
                 orow = build_order_row(
                     run_id, order_id, m, dec, sig_q, exec_target_ts, latency_ms,
@@ -1421,7 +1430,7 @@ def run_unified_replay_backtest(
 
                 # 结算只加 payout_usdc，不再重复扣除 cost_usdc
                 eq_after_payout, peak_after_payout, _ = bookkeeper.apply_payout(payout)
-                strat.sync_drawdown_state(eq_after_payout, peak_after_payout)
+                strat.sync_drawdown_state(eq_after_payout, peak_after_payout, ts=m.expiry_ts)
 
                 srow = build_settlement_row(
                     run_id, orow, m.expiry_ts, settled_twap, mark_px_expiry, outcome_up,
@@ -1438,6 +1447,10 @@ def run_unified_replay_backtest(
         outcome_logger.close()
 
     end_ts = time.time()
+    shadow_metrics = compute_settlement_shadow_equity(
+        cfg.initial_equity,
+        [float(r["equity_after"]) for r in settled_records],
+    )
     extra_metrics = {
         "markets_replayed": len(m_rows),
         "settled_trades": len(settled_records),
@@ -1448,6 +1461,8 @@ def run_unified_replay_backtest(
         "order_status_breakdown": order_status_counts,
         "decision_sample_breakdown": decision_counts,
         "halted_by_drawdown": strat.halted,
+        **strat.halt_snapshot(),
+        **shadow_metrics,
     }
     exec_params = {
         "latency_ms": latency_ms,
