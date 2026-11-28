@@ -13,6 +13,7 @@ import requests
 from scipy.stats import norm, t as student_t
 
 from market_data import LiveMarketFeed, MarketTapeWriter, init_db
+from paper_bookkeeping import is_drawdown_halted, utc_iso
 
 
 # ============================================================
@@ -746,13 +747,67 @@ class HIP4AsianBinaryStrategy:
         self.stale_book_ms = stale_book_ms
         self.peak_equity = cfg.initial_equity
         self.halted = False
+        self.halted_at_utc: Optional[str] = None
+        self.halted_peak_equity: Optional[float] = None
+        self.halted_equity: Optional[float] = None
+        self.halted_drawdown_pct: Optional[float] = None
         self.market_trades: Dict[str, int] = {}
         self.in_flight_markets: set[str] = set()
 
-    def sync_drawdown_state(self, equity: float, peak_equity: float):
-        self.peak_equity = max(self.peak_equity, peak_equity, equity)
-        if self.peak_equity > 0 and (self.peak_equity - equity) / self.peak_equity >= self.cfg.daily_drawdown_limit:
+    def sync_drawdown_state(
+        self,
+        equity: float,
+        peak_equity: float,
+        ts: Optional[float] = None,
+    ) -> bool:
+        """
+        唯一 halt 翻转入口：
+        - 复用 paper_bookkeeping.is_drawdown_halted（正式预扣现金口径、本跑峰值、无日历日重置）。
+        - halted 一旦置 True 即在本进程内保持粘性，不再自动恢复。
+        - 仅在首次从 False 翻转为 True 时向 stdout 打一行结构化日志并保存快照。
+        """
+        self.peak_equity = max(self.peak_equity, float(peak_equity), float(equity))
+        if self.halted:
+            return False
+
+        triggered, dd = is_drawdown_halted(
+            equity=equity,
+            peak_equity=self.peak_equity,
+            limit=self.cfg.daily_drawdown_limit,
+        )
+        if triggered:
             self.halted = True
+            event_ts = time.time() if ts is None else float(ts)
+            self.halted_at_utc = utc_iso(event_ts)
+            self.halted_peak_equity = round(self.peak_equity, 4)
+            self.halted_equity = round(float(equity), 4)
+            self.halted_drawdown_pct = round(dd * 100.0, 3)
+            # 必须走 stdout print 以便随进程重定向写入 runtime.log，不另建 logger
+            print(
+                f"[Risk] HALT_DRAWDOWN ts={self.halted_at_utc} "
+                f"peak_equity={self.halted_peak_equity:.4f} "
+                f"equity={self.halted_equity:.4f} "
+                f"drawdown_pct={self.halted_drawdown_pct:.3f} "
+                f"limit={self.cfg.daily_drawdown_limit}"
+            )
+            return True
+        return False
+
+    def halt_snapshot(self) -> dict:
+        """返回首次 halt 翻转快照；未翻转时返回 None 占位，绝不用 0 冒充。"""
+        if not self.halted:
+            return {
+                "halted_at_utc": None,
+                "halted_peak_equity": None,
+                "halted_equity": None,
+                "halted_drawdown_pct": None,
+            }
+        return {
+            "halted_at_utc": self.halted_at_utc,
+            "halted_peak_equity": self.halted_peak_equity,
+            "halted_equity": self.halted_equity,
+            "halted_drawdown_pct": self.halted_drawdown_pct,
+        }
 
     def record_fill(self, outcome_id: str) -> int:
         """仅在订单状态确认 FILLED 后调用，累加该场次已用额度。"""
@@ -813,7 +868,7 @@ class HIP4AsianBinaryStrategy:
         peak_equity: float,
     ) -> EvaluationDecision:
         """唯一信号评价实现（纸面与回放共用）。只读 market_trades，不修改额度。"""
-        self.sync_drawdown_state(equity, peak_equity)
+        self.sync_drawdown_state(equity, peak_equity, ts=ts)
 
         tau_sec = market.expiry_ts - ts
         p_up, p_up_norm, z = self.fair_prob_up_twap(mark_px, market.strike, tau_sec, ann_vol, acc_twap)
