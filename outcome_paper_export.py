@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import csv
 import hashlib
-import inspect
 import json
 import math
 import signal
@@ -11,10 +10,10 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -22,15 +21,30 @@ import outcome_hip4_engine as engine_mod
 from market_data import BookEvent, LiveMarketFeed, MarkEvent, MarketTapeWriter
 from outcome_hip4_engine import (
     ENDPOINTS,
+    REJECT_COOLDOWN_SEC,
+    DetailedFill,
+    EvaluationDecision,
     HIP4AsianBinaryStrategy,
     OutcomeMarket,
     RollingMarkVol,
+    SideQuote,
     StrategyConfig,
     compute_strict_twap,
+    decompose_slippage,
+    extract_side_quote,
     fetch_l2_book_rest,
     fetch_outcome_markets,
     parse_book_levels,
+    simulate_clob_buy_fill_detailed,
 )
+from paper_bookkeeping import (
+    apply_fill_equity,
+    apply_payout_equity,
+    update_peak_dd,
+)
+
+# 兼容既有引用名：与引擎策略类为同一实现，不再维护第二套 evaluate
+InstrumentedHIP4Strategy = HIP4AsianBinaryStrategy
 
 SETTLEMENT_FEE_NOTE = (
     "--settlement-fee 默认 0.0007 仅为可配模拟/回测参数，并非已核实的 Outcome 官方统一结算费率；"
@@ -39,157 +53,31 @@ SETTLEMENT_FEE_NOTE = (
 
 
 # ============================================================
-# 1. 账务核算层：优先复用 paper_bookkeeping.py
+# 1. 账务核算层：净值与回撤改写唯一委托给 paper_bookkeeping.py
 # ============================================================
-
-def _fallback_apply_fill_equity(
-    equity: float, peak_equity: float, max_dd: float, cost_usdc: float
-) -> Tuple[float, float, float]:
-    new_eq = equity - cost_usdc
-    new_peak = max(peak_equity, new_eq)
-    dd = (new_peak - new_eq) / new_peak if new_peak > 0 else 0.0
-    return new_eq, new_peak, max(max_dd, dd)
-
-
-def _fallback_apply_payout_equity(
-    equity: float, peak_equity: float, max_dd: float, payout_usdc: float
-) -> Tuple[float, float, float]:
-    new_eq = equity + payout_usdc
-    new_peak = max(peak_equity, new_eq)
-    dd = (new_peak - new_eq) / new_peak if new_peak > 0 else 0.0
-    return new_eq, new_peak, max(max_dd, dd)
-
 
 class EquityBookkeeper:
     """
-    成交即扣 cost_usdc 并更新 peak_equity / max_dd；
-    结算只加 payout_usdc 并更新 peak_equity / max_dd，避免成本重复扣除。
-    若同目录存在 paper_bookkeeping.py 且提供 apply_fill_equity / apply_payout_equity，优先复用。
+    有状态账本包装：
+    - 成交即调用 paper_bookkeeping.apply_fill_equity 扣减 cost_usdc 并刷新 peak/max_dd；
+    - 结算只调用 paper_bookkeeping.apply_payout_equity 增加 payout_usdc 并刷新 peak/max_dd。
     """
     def __init__(self, initial_equity: float):
         self.initial_equity = float(initial_equity)
         self.equity = float(initial_equity)
         self.peak_equity = float(initial_equity)
         self.max_dd = 0.0
-        self.source = "builtin_fallback"
-        self._ext_fill = None
-        self._ext_payout = None
-        self._load_external_bookkeeping()
-
-    def _load_external_bookkeeping(self):
-        try:
-            import paper_bookkeeping as pb  # type: ignore
-
-            fill_fn = getattr(pb, "apply_fill_equity", None)
-            payout_fn = getattr(pb, "apply_payout_equity", None)
-            if callable(fill_fn) and callable(payout_fn):
-                self._ext_fill = fill_fn
-                self._ext_payout = payout_fn
-                self.source = "paper_bookkeeping"
-        except Exception:
-            self.source = "builtin_fallback"
-
-    def _invoke_ext(self, fn, amount_val: float, amount_aliases: Tuple[str, ...]) -> Optional[Tuple[float, float, float]]:
-        try:
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.values())
-            pool: Dict[str, Any] = {
-                "equity": self.equity,
-                "cash": self.equity,
-                "balance": self.equity,
-                "current_equity": self.equity,
-                "peak_equity": self.peak_equity,
-                "peak": self.peak_equity,
-                "max_dd": self.max_dd,
-                "max_drawdown": self.max_dd,
-            }
-            for alias in amount_aliases:
-                pool[alias] = amount_val
-
-            kwargs = {}
-            all_named_matched = True
-            for p in params:
-                if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                    continue
-                if p.name in pool:
-                    kwargs[p.name] = pool[p.name]
-                elif p.default is inspect.Parameter.empty:
-                    all_named_matched = False
-                    break
-
-            if all_named_matched and kwargs:
-                res = fn(**kwargs)
-            elif len(params) == 4:
-                res = fn(self.equity, self.peak_equity, self.max_dd, amount_val)
-            elif len(params) == 3:
-                res = fn(self.equity, self.peak_equity, amount_val)
-            elif len(params) == 2:
-                res = fn(self.equity, amount_val)
-            else:
-                return None
-
-            return self._normalize_result(res)
-        except Exception as exc:
-            print(f"[Bookkeeping] 调用 paper_bookkeeping 失败 ({exc})，已回退至内置等价核算。")
-            self._ext_fill = None
-            self._ext_payout = None
-            self.source = "builtin_fallback"
-            return None
-
-    def _normalize_result(self, res: Any) -> Tuple[float, float, float]:
-        new_eq = self.equity
-        new_peak = self.peak_equity
-        new_dd = self.max_dd
-
-        if isinstance(res, (tuple, list)):
-            if len(res) >= 3:
-                new_eq, new_peak, new_dd = float(res[0]), float(res[1]), float(res[2])
-            elif len(res) == 2:
-                new_eq, new_peak = float(res[0]), float(res[1])
-                dd = (new_peak - new_eq) / new_peak if new_peak > 0 else 0.0
-                new_dd = max(self.max_dd, dd)
-            elif len(res) == 1:
-                new_eq = float(res[0])
-                new_peak = max(self.peak_equity, new_eq)
-                dd = (new_peak - new_eq) / new_peak if new_peak > 0 else 0.0
-                new_dd = max(self.max_dd, dd)
-        elif isinstance(res, dict):
-            new_eq = float(res.get("equity", self.equity))
-            new_peak = float(res.get("peak_equity", max(self.peak_equity, new_eq)))
-            dd = (new_peak - new_eq) / new_peak if new_peak > 0 else 0.0
-            new_dd = float(res.get("max_dd", max(self.max_dd, dd)))
-        elif isinstance(res, (int, float)):
-            new_eq = float(res)
-            new_peak = max(self.peak_equity, new_eq)
-            dd = (new_peak - new_eq) / new_peak if new_peak > 0 else 0.0
-            new_dd = max(self.max_dd, dd)
-        elif hasattr(res, "equity"):
-            new_eq = float(getattr(res, "equity"))
-            new_peak = float(getattr(res, "peak_equity", max(self.peak_equity, new_eq)))
-            dd = (new_peak - new_eq) / new_peak if new_peak > 0 else 0.0
-            new_dd = float(getattr(res, "max_dd", max(self.max_dd, dd)))
-
-        return new_eq, new_peak, new_dd
+        self.source = "paper_bookkeeping"
 
     def apply_fill(self, cost_usdc: float) -> Tuple[float, float, float]:
-        if self._ext_fill is not None:
-            ext_res = self._invoke_ext(self._ext_fill, cost_usdc, ("cost_usdc", "cost", "stake", "amount"))
-            if ext_res is not None:
-                self.equity, self.peak_equity, self.max_dd = ext_res
-                return ext_res
-        res = _fallback_apply_fill_equity(self.equity, self.peak_equity, self.max_dd, cost_usdc)
-        self.equity, self.peak_equity, self.max_dd = res
-        return res
+        self.equity = float(apply_fill_equity(self.equity, cost_usdc))
+        self.peak_equity, self.max_dd = update_peak_dd(self.equity, self.peak_equity, self.max_dd)
+        return self.equity, self.peak_equity, self.max_dd
 
     def apply_payout(self, payout_usdc: float) -> Tuple[float, float, float]:
-        if self._ext_payout is not None:
-            ext_res = self._invoke_ext(self._ext_payout, payout_usdc, ("payout_usdc", "payout", "amount"))
-            if ext_res is not None:
-                self.equity, self.peak_equity, self.max_dd = ext_res
-                return ext_res
-        res = _fallback_apply_payout_equity(self.equity, self.peak_equity, self.max_dd, payout_usdc)
-        self.equity, self.peak_equity, self.max_dd = res
-        return res
+        self.equity = float(apply_payout_equity(self.equity, payout_usdc))
+        self.peak_equity, self.max_dd = update_peak_dd(self.equity, self.peak_equity, self.max_dd)
+        return self.equity, self.peak_equity, self.max_dd
 
 
 # ============================================================
@@ -324,168 +212,8 @@ def write_csv_snapshot(path: Path, fieldnames: List[str], rows: List[dict]):
 
 
 # ============================================================
-# 3. 盘口标准化、深度吃单与三段滑点拆解
+# 3. 决策采样节流器
 # ============================================================
-
-@dataclass
-class SideQuote:
-    bid: Optional[float]
-    ask: Optional[float]
-    mid: Optional[float]
-    spread: Optional[float]
-    bid_sz: float
-    ask_sz: float
-
-
-@dataclass
-class DetailedFill:
-    filled_shares: int
-    vwap: float
-    cost_usdc: float
-    levels_consumed: int
-    worst_fill_px: float
-    top_ask_px: float
-    top_ask_usdc: float
-    total_avail_usdc: float
-    depth_covers_target: bool
-    fill_ratio: float
-
-
-def extract_side_quote(
-    side: str,
-    yes_bids: List[Tuple[float, float]],
-    yes_asks: List[Tuple[float, float]],
-) -> SideQuote:
-    if side == "UP":
-        bid = yes_bids[0][0] if yes_bids else None
-        bid_sz = yes_bids[0][1] if yes_bids else 0.0
-        ask = yes_asks[0][0] if yes_asks else None
-        ask_sz = yes_asks[0][1] if yes_asks else 0.0
-    else:
-        ask = round(1.0 - yes_bids[0][0], 5) if yes_bids else None
-        ask_sz = yes_bids[0][1] if yes_bids else 0.0
-        bid = round(1.0 - yes_asks[0][0], 5) if yes_asks else None
-        bid_sz = yes_asks[0][1] if yes_asks else 0.0
-
-    mid = round((bid + ask) / 2.0, 5) if (bid is not None and ask is not None) else None
-    spread = round(ask - bid, 5) if (bid is not None and ask is not None) else None
-    return SideQuote(bid=bid, ask=ask, mid=mid, spread=spread, bid_sz=bid_sz, ask_sz=ask_sz)
-
-
-def simulate_clob_buy_fill_detailed(
-    side: str,
-    target_usdc: float,
-    yes_bids: List[Tuple[float, float]],
-    yes_asks: List[Tuple[float, float]],
-    min_notional: float = 1.0,
-) -> Optional[DetailedFill]:
-    if side == "UP":
-        ladder = [(px, sz) for px, sz in yes_asks if 0.0 < px < 1.0 and sz > 0]
-    else:
-        ladder = [(round(1.0 - px, 5), sz) for px, sz in yes_bids if 0.0 < px < 1.0 and sz > 0]
-
-    if not ladder:
-        return None
-
-    total_avail_usdc = sum(px * math.floor(sz) for px, sz in ladder)
-    top_ask_px = ladder[0][0]
-    top_ask_usdc = top_ask_px * math.floor(ladder[0][1])
-
-    remaining_usdc = target_usdc
-    total_shares = 0
-    total_cost = 0.0
-    levels_consumed = 0
-    worst_fill_px = top_ask_px
-
-    for px, avail_sz in ladder:
-        if px <= 0.0 or remaining_usdc < px:
-            break
-        max_afford = int(math.floor(remaining_usdc / px))
-        take_shares = min(int(math.floor(avail_sz)), max_afford)
-        if take_shares <= 0:
-            continue
-        cost = take_shares * px
-        total_shares += take_shares
-        total_cost += cost
-        remaining_usdc -= cost
-        levels_consumed += 1
-        worst_fill_px = px
-        if remaining_usdc < px:
-            break
-
-    if total_shares <= 0 or total_cost < min_notional:
-        return None
-
-    vwap = total_cost / total_shares
-    return DetailedFill(
-        filled_shares=total_shares,
-        vwap=vwap,
-        cost_usdc=total_cost,
-        levels_consumed=levels_consumed,
-        worst_fill_px=worst_fill_px,
-        top_ask_px=top_ask_px,
-        top_ask_usdc=top_ask_usdc,
-        total_avail_usdc=total_avail_usdc,
-        depth_covers_target=(total_avail_usdc >= target_usdc),
-        fill_ratio=(total_cost / target_usdc) if target_usdc > 0 else 0.0,
-    )
-
-
-def decompose_slippage(fill_vwap: float, sig_q: SideQuote, exec_q: SideQuote) -> dict:
-    return {
-        "slip_vs_sig_mid": (fill_vwap - sig_q.mid) if sig_q.mid is not None else None,
-        "slip_vs_exec_mid": (fill_vwap - exec_q.mid) if exec_q.mid is not None else None,
-        "slip_vs_sig_ask": (fill_vwap - sig_q.ask) if sig_q.ask is not None else None,
-        "slip_book_walk": (fill_vwap - exec_q.ask) if exec_q.ask is not None else None,
-        "slip_latency_drift": (
-            (exec_q.ask - sig_q.ask) if (exec_q.ask is not None and sig_q.ask is not None) else None
-        ),
-    }
-
-
-# ============================================================
-# 4. 带完整决策审计与仓位快照的策略封装
-# ============================================================
-
-@dataclass
-class EvaluationDecision:
-    should_trade: bool
-    filter_reason: str
-    outcome_id: str
-    ts: float
-    tau_sec: float
-    strike: float
-    mark_px: float
-    acc_twap: Optional[float]
-    ann_vol: float
-    p_up: float
-    p_up_normal: float
-    z_score: float
-    up_bid: Optional[float]
-    up_ask: Optional[float]
-    down_bid: Optional[float]
-    down_ask: Optional[float]
-    edge_up: Optional[float]
-    edge_down: Optional[float]
-    best_side: str
-    best_edge: Optional[float]
-    active_min_edge: float
-    gamma_penalty_applied: float
-    eff_settle_fee: float
-    book_age_ms: float
-    book_stale: bool
-    equity_at_signal: float
-    market_trades_used_before: int
-    kelly_full: Optional[float]
-    kelly_scaled: Optional[float]
-    target_risk_pct: Optional[float]
-    kelly_capped: Optional[bool]
-    target_usdc: Optional[float]
-    side: Optional[str] = None
-    fair_prob: Optional[float] = None
-    top_ask: Optional[float] = None
-    expected_edge: Optional[float] = None
-
 
 class DecisionSampler:
     """按状态变化、时间段切换、接近门槛、定期心跳四类触发器节流落盘未开仓日志"""
@@ -539,201 +267,8 @@ class DecisionSampler:
         return None
 
 
-class InstrumentedHIP4Strategy(HIP4AsianBinaryStrategy):
-    def __init__(self, cfg: StrategyConfig, stale_book_ms: float = 5000.0):
-        super().__init__(cfg)
-        self.stale_book_ms = stale_book_ms
-        self.in_flight_markets: set[str] = set()
-
-    def sync_drawdown_state(self, equity: float, peak_equity: float):
-        self.peak_equity = max(self.peak_equity, peak_equity, equity)
-        if self.peak_equity > 0 and (self.peak_equity - equity) / self.peak_equity >= self.cfg.daily_drawdown_limit:
-            self.halted = True
-
-    def evaluate_with_audit(
-        self,
-        market: OutcomeMarket,
-        ts: float,
-        mark_px: float,
-        ann_vol: float,
-        yes_bids: List[Tuple[float, float]],
-        yes_asks: List[Tuple[float, float]],
-        book_ts: float,
-        acc_twap: Optional[float],
-        equity: float,
-        peak_equity: float,
-    ) -> EvaluationDecision:
-        self.sync_drawdown_state(equity, peak_equity)
-
-        tau_sec = market.expiry_ts - ts
-        p_up, p_up_norm, z = self.fair_prob_up_twap(mark_px, market.strike, tau_sec, ann_vol, acc_twap)
-        p_down = 1.0 - p_up
-
-        if tau_sec > 300.0:
-            base_edge = self.cfg.edge_early
-        elif tau_sec > 60.0:
-            base_edge = self.cfg.edge_mid
-        else:
-            base_edge = self.cfg.edge_twap_zone
-
-        gamma_pen = (
-            self.cfg.gamma_penalty
-            if (tau_sec <= self.cfg.gamma_zone_tau and abs(z) < self.cfg.gamma_zone_z)
-            else 0.0
-        )
-        active_min_edge = base_edge + gamma_pen
-        eff_settle_fee = self.cfg.settlement_fee_rate * market.fee_scale
-        net_payout = 1.0 - eff_settle_fee
-
-        up_q = extract_side_quote("UP", yes_bids, yes_asks)
-        down_q = extract_side_quote("DOWN", yes_bids, yes_asks)
-        edge_up = (p_up * net_payout - up_q.ask) if up_q.ask is not None else None
-        edge_down = (p_down * net_payout - down_q.ask) if down_q.ask is not None else None
-
-        best_side = ""
-        best_edge: Optional[float] = None
-        if edge_up is not None and (edge_down is None or edge_up >= edge_down):
-            best_side, best_edge = "UP", edge_up
-        elif edge_down is not None:
-            best_side, best_edge = "DOWN", edge_down
-
-        book_age_ms = max(0.0, (ts - book_ts) * 1000.0)
-        book_stale = book_age_ms > self.stale_book_ms
-        used_before = self.market_trades.get(market.outcome_id, 0)
-
-        def make_reject(
-            reason: str,
-            k_full: Optional[float] = None,
-            k_scaled: Optional[float] = None,
-            t_risk: Optional[float] = None,
-            k_cap: Optional[bool] = None,
-            t_usdc: Optional[float] = None,
-        ) -> EvaluationDecision:
-            return EvaluationDecision(
-                should_trade=False,
-                filter_reason=reason,
-                outcome_id=market.outcome_id,
-                ts=ts,
-                tau_sec=tau_sec,
-                strike=market.strike,
-                mark_px=mark_px,
-                acc_twap=acc_twap,
-                ann_vol=ann_vol,
-                p_up=p_up,
-                p_up_normal=p_up_norm,
-                z_score=z,
-                up_bid=up_q.bid,
-                up_ask=up_q.ask,
-                down_bid=down_q.bid,
-                down_ask=down_q.ask,
-                edge_up=edge_up,
-                edge_down=edge_down,
-                best_side=best_side,
-                best_edge=best_edge,
-                active_min_edge=active_min_edge,
-                gamma_penalty_applied=gamma_pen,
-                eff_settle_fee=eff_settle_fee,
-                book_age_ms=book_age_ms,
-                book_stale=book_stale,
-                equity_at_signal=equity,
-                market_trades_used_before=used_before,
-                kelly_full=k_full,
-                kelly_scaled=k_scaled,
-                target_risk_pct=t_risk,
-                kelly_capped=k_cap,
-                target_usdc=t_usdc,
-            )
-
-        if self.halted:
-            return make_reject("HALTED_DRAWDOWN")
-        if tau_sec < self.cfg.min_tau_sec:
-            return make_reject("TAU_TOO_SMALL")
-        if tau_sec > self.cfg.max_tau_sec:
-            return make_reject("TAU_TOO_LARGE")
-        if used_before >= self.cfg.max_trades_per_market:
-            return make_reject("MAX_TRADES_REACHED")
-        if market.outcome_id in self.in_flight_markets:
-            return make_reject("ORDER_IN_FLIGHT")
-        if not yes_bids and not yes_asks:
-            return make_reject("EMPTY_BOOK")
-
-        edge_pass = []
-        if edge_up is not None and edge_up > active_min_edge:
-            edge_pass.append(("UP", edge_up, up_q.ask, p_up))
-        if edge_down is not None and edge_down > active_min_edge:
-            edge_pass.append(("DOWN", edge_down, down_q.ask, p_down))
-
-        if not edge_pass:
-            return make_reject("EDGE_BELOW_THRESHOLD")
-
-        edge_pass.sort(key=lambda x: x[1], reverse=True)
-        band_pass = [
-            c for c in edge_pass
-            if c[2] is not None and (self.cfg.min_entry_price <= c[2] <= self.cfg.max_entry_price)
-        ]
-        if not band_pass:
-            return make_reject("PRICE_OUT_OF_BAND")
-
-        side, edge, top_ask, fair_p = band_pass[0]
-
-        kelly_full = edge / max(1e-6, (net_payout - top_ask))
-        kelly_scaled = self.cfg.kelly_fraction * kelly_full
-        kelly_capped = kelly_scaled > self.cfg.max_market_risk_pct
-        target_risk_pct = min(self.cfg.max_market_risk_pct, kelly_scaled)
-        target_usdc = round(max(0.0, equity) * target_risk_pct, 2)
-
-        if target_usdc < self.cfg.min_order_notional:
-            return make_reject(
-                "STAKE_TOO_SMALL",
-                k_full=kelly_full,
-                k_scaled=kelly_scaled,
-                t_risk=target_risk_pct,
-                k_cap=kelly_capped,
-                t_usdc=target_usdc,
-            )
-
-        return EvaluationDecision(
-            should_trade=True,
-            filter_reason="SIGNAL_TRIGGERED",
-            outcome_id=market.outcome_id,
-            ts=ts,
-            tau_sec=tau_sec,
-            strike=market.strike,
-            mark_px=mark_px,
-            acc_twap=acc_twap,
-            ann_vol=ann_vol,
-            p_up=p_up,
-            p_up_normal=p_up_norm,
-            z_score=z,
-            up_bid=up_q.bid,
-            up_ask=up_q.ask,
-            down_bid=down_q.bid,
-            down_ask=down_q.ask,
-            edge_up=edge_up,
-            edge_down=edge_down,
-            best_side=side,
-            best_edge=edge,
-            active_min_edge=active_min_edge,
-            gamma_penalty_applied=gamma_pen,
-            eff_settle_fee=eff_settle_fee,
-            book_age_ms=book_age_ms,
-            book_stale=book_stale,
-            equity_at_signal=equity,
-            market_trades_used_before=used_before,
-            kelly_full=kelly_full,
-            kelly_scaled=kelly_scaled,
-            target_risk_pct=target_risk_pct,
-            kelly_capped=kelly_capped,
-            target_usdc=target_usdc,
-            side=side,
-            fair_prob=fair_p,
-            top_ask=top_ask,
-            expected_edge=edge,
-        )
-
-
 # ============================================================
-# 5. CSV 表头（兼容 outcome_review.py + 补齐全部诊断字段）
+# 4. CSV 表头（兼容 outcome_review.py + 补齐全部诊断字段）
 # ============================================================
 
 DECISION_FIELDS = [
@@ -1121,7 +656,7 @@ def write_summary_and_metadata(
 
 
 # ============================================================
-# 6. 实时模拟盘（跟踪异步任务 + 优雅退出 + 兼容导出）
+# 5. 实时模拟盘（经由共享采集层同步写 SQLite 磁带 + 优雅退出）
 # ============================================================
 
 async def run_paper_trading(
@@ -1155,7 +690,7 @@ async def run_paper_trading(
     tape_writer = MarketTapeWriter(db_path)
 
     bookkeeper = EquityBookkeeper(cfg.initial_equity)
-    strat = InstrumentedHIP4Strategy(cfg, stale_book_ms=stale_book_ms)
+    strat = HIP4AsianBinaryStrategy(cfg, stale_book_ms=stale_book_ms)
     sampler = DecisionSampler(
         sample_interval_sec=decision_sample_sec,
         near_edge_margin=near_edge_margin,
@@ -1212,7 +747,7 @@ async def run_paper_trading(
                 )
                 order_logger.append(row)
                 order_status_counts["REJECTED:NO_BOOK"] = order_status_counts.get("REJECTED:NO_BOOK", 0) + 1
-                reject_cooldown_until[market.outcome_id] = exec_ts + 3.0
+                reject_cooldown_until[market.outcome_id] = exec_ts + REJECT_COOLDOWN_SEC
                 return
 
             yes_bids, yes_asks, exec_book_ts = book
@@ -1227,7 +762,7 @@ async def run_paper_trading(
                 )
                 order_logger.append(row)
                 order_status_counts["REJECTED:BOOK_STALE"] = order_status_counts.get("REJECTED:BOOK_STALE", 0) + 1
-                reject_cooldown_until[market.outcome_id] = exec_ts + 3.0
+                reject_cooldown_until[market.outcome_id] = exec_ts + REJECT_COOLDOWN_SEC
                 return
 
             fill = simulate_clob_buy_fill_detailed(
@@ -1244,7 +779,7 @@ async def run_paper_trading(
                 )
                 order_logger.append(row)
                 order_status_counts["REJECTED:NO_LIQUIDITY"] = order_status_counts.get("REJECTED:NO_LIQUIDITY", 0) + 1
-                reject_cooldown_until[market.outcome_id] = exec_ts + 3.0
+                reject_cooldown_until[market.outcome_id] = exec_ts + REJECT_COOLDOWN_SEC
                 return
 
             if fill.cost_usdc > bookkeeper.equity:
@@ -1256,7 +791,7 @@ async def run_paper_trading(
                 order_status_counts["REJECTED:INSUFFICIENT_EQUITY"] = (
                     order_status_counts.get("REJECTED:INSUFFICIENT_EQUITY", 0) + 1
                 )
-                reject_cooldown_until[market.outcome_id] = exec_ts + 3.0
+                reject_cooldown_until[market.outcome_id] = exec_ts + REJECT_COOLDOWN_SEC
                 return
 
             max_limit_px = min(cfg.max_entry_price, dec.top_ask + max_slippage)
@@ -1269,14 +804,14 @@ async def run_paper_trading(
                 order_status_counts["REJECTED:SLIPPAGE_EXCEEDED"] = (
                     order_status_counts.get("REJECTED:SLIPPAGE_EXCEEDED", 0) + 1
                 )
-                reject_cooldown_until[market.outcome_id] = exec_ts + 3.0
+                reject_cooldown_until[market.outcome_id] = exec_ts + REJECT_COOLDOWN_SEC
                 print(
                     f"[Paper] {order_id} #{market.outcome_id} {dec.side} IOC拒单 | "
                     f"SigAsk={dec.top_ask:.4f} -> VWAP={fill.vwap:.4f} (Walk={row['slip_book_walk']}, Drift={row['slip_latency_drift']})"
                 )
                 return
 
-            # 成交立即扣减本金，并马上刷新峰值与最大回撤
+            # 成交立即扣减本金，刷新峰值与最大回撤，且只有 FILLED 才占用单场额度
             eq_after_fill, peak_after_fill, _ = bookkeeper.apply_fill(fill.cost_usdc)
             strat.sync_drawdown_state(eq_after_fill, peak_after_fill)
 
@@ -1286,7 +821,7 @@ async def run_paper_trading(
             )
             order_logger.append(row)
             order_status_counts["FILLED"] = order_status_counts.get("FILLED", 0) + 1
-            strat.market_trades[market.outcome_id] = strat.market_trades.get(market.outcome_id, 0) + 1
+            strat.record_fill(market.outcome_id)
             traded_market_ids.add(market.outcome_id)
 
             open_positions.append({
@@ -1345,6 +880,7 @@ async def run_paper_trading(
                 payout = orow["filled_shares"] * (1.0 - pos["eff_settle_fee"]) if won else 0.0
                 pnl = payout - float(orow["cost_usdc"])
 
+                # 结算只加 payout_usdc，不再重复扣减 cost_usdc
                 eq_after_payout, peak_after_payout, _ = bookkeeper.apply_payout(payout)
                 strat.sync_drawdown_state(eq_after_payout, peak_after_payout)
 
@@ -1412,7 +948,7 @@ async def run_paper_trading(
     def handle_book(ev: BookEvent):
         nonlocal order_seq
         oid = ev.outcome_id
-        # 与现码一致：REST 补快照仅刷新盘口缓存，不直接触发策略下单
+        # 与现码一致：REST 补快照仅刷新内存盘口，不直接触发下单评估
         if ev.source == "rest":
             latest_books[oid] = (ev.bids, ev.asks, ev.recv_ts)
             return
@@ -1511,7 +1047,7 @@ async def run_paper_trading(
             except asyncio.TimeoutError:
                 print(f"[Paper] 警告: 等待在途延迟单超时 ({drain_timeout:.1f}s)，继续执行结算收尾。")
 
-        # 2) 再做一次到期结算，并同步落盘 SQLite 磁带结算结果
+        # 2) 再做一次到期结算，并同步回写 SQLite 磁带结算结果
         check_settlements()
         tape_writer.settle_expired_markets(compute_strict_twap)
         tape_writer.close()
@@ -1559,7 +1095,7 @@ async def run_paper_trading(
 
 
 # ============================================================
-# 7. 离线回放回测（SQLite 前置校验 + 成交先扣款 + 兼容导出）
+# 6. 唯一离线回放回测路径（export-backtest 与 engine backtest 共用）
 # ============================================================
 
 def validate_replay_db(db_path: str) -> Tuple[Optional[sqlite3.Connection], List[tuple]]:
@@ -1583,7 +1119,7 @@ def validate_replay_db(db_path: str) -> Tuple[Optional[sqlite3.Connection], List
     if missing:
         print(
             f"[ExportBT] 错误: 数据库 {path.name} 缺少必需表 {missing}（当前仅包含 {sorted(tables)}）。"
-            f"请先使用 outcome_hip4_engine.py record 录制数据。"
+            f"请先使用 outcome_hip4_engine.py record 或 outcome_paper_export.py paper --db 录制数据。"
         )
         conn.close()
         return None, []
@@ -1602,6 +1138,7 @@ def validate_replay_db(db_path: str) -> Tuple[Optional[sqlite3.Connection], List
     if not m_rows:
         print(
             f"[ExportBT] 错误: 数据库 {path.name} 中共有 {total_markets} 个场次，但已结算场次（outcome_up 非空）为 0，无法回测。"
+            f"请确认已通过 record 或 paper --db 录完至少一个完整到期窗口。"
         )
         conn.close()
         return None, []
@@ -1609,7 +1146,7 @@ def validate_replay_db(db_path: str) -> Tuple[Optional[sqlite3.Connection], List
     return conn, m_rows
 
 
-def export_replay_backtest(
+def run_unified_replay_backtest(
     db_path: str,
     cfg: StrategyConfig,
     latency_ms: int,
@@ -1621,11 +1158,11 @@ def export_replay_backtest(
     out_root_arg: str,
     subdir_by_run_id: bool,
     network: str = "mainnet",
-) -> bool:
+) -> Tuple[bool, Optional[dict]]:
     start_ts = time.time()
     conn, m_rows = validate_replay_db(db_path)
     if conn is None:
-        return False
+        return False, None
 
     underlyings = sorted({r[2] for r in m_rows})
     periods = sorted({r[5] for r in m_rows})
@@ -1643,7 +1180,7 @@ def export_replay_backtest(
     outcome_logger = LiveCSVLogger(out_dir / "market_outcomes.csv", OUTCOME_FIELDS)
 
     bookkeeper = EquityBookkeeper(cfg.initial_equity)
-    strat = InstrumentedHIP4Strategy(cfg, stale_book_ms=stale_book_ms)
+    strat = HIP4AsianBinaryStrategy(cfg, stale_book_ms=stale_book_ms)
     sampler = DecisionSampler(
         sample_interval_sec=decision_sample_sec,
         near_edge_margin=near_edge_margin,
@@ -1696,6 +1233,7 @@ def export_replay_backtest(
             twap_buffer: List[Tuple[float, float]] = []
             filled_orders_this_market: List[Tuple[dict, float]] = []
             reject_cooldown_ts = -1e9
+            in_flight_until_ts = -1e9
 
             for b_idx, (bts, bids_s, asks_s) in enumerate(book_rows):
                 while mark_idx < len(mark_rows) and mark_rows[mark_idx][0] <= bts:
@@ -1734,6 +1272,11 @@ def export_replay_backtest(
                 yes_bids = json.loads(bids_s)
                 yes_asks = json.loads(asks_s)
 
+                if bts < in_flight_until_ts:
+                    strat.in_flight_markets.add(m.outcome_id)
+                else:
+                    strat.in_flight_markets.discard(m.outcome_id)
+
                 dec = strat.evaluate_with_audit(
                     m, bts, latest_mark_px, ann_vol, yes_bids, yes_asks, bts,
                     acc_twap, bookkeeper.equity, bookkeeper.peak_equity,
@@ -1754,6 +1297,7 @@ def export_replay_backtest(
                 order_id = f"BT-{order_seq:05d}"
                 sig_q = extract_side_quote(dec.side, yes_bids, yes_asks)
                 exec_target_ts = bts + latency_sec
+                in_flight_until_ts = exec_target_ts
 
                 exec_book_idx = max(0, int(np.searchsorted(book_ts_arr, exec_target_ts, side="right")) - 1)
                 exec_book_ts, exec_bids_s, exec_asks_s = book_rows[exec_book_idx]
@@ -1816,7 +1360,7 @@ def export_replay_backtest(
 
                 if exec_book_stale:
                     log_bt_reject("BOOK_STALE")
-                    reject_cooldown_ts = exec_target_ts + 3.0
+                    reject_cooldown_ts = exec_target_ts + REJECT_COOLDOWN_SEC
                     continue
 
                 fill = simulate_clob_buy_fill_detailed(
@@ -1828,20 +1372,20 @@ def export_replay_backtest(
                 )
                 if fill is None:
                     log_bt_reject("NO_LIQUIDITY")
-                    reject_cooldown_ts = exec_target_ts + 3.0
+                    reject_cooldown_ts = exec_target_ts + REJECT_COOLDOWN_SEC
                     continue
 
                 if fill.cost_usdc > bookkeeper.equity:
                     log_bt_reject("INSUFFICIENT_EQUITY", fill)
-                    reject_cooldown_ts = exec_target_ts + 3.0
+                    reject_cooldown_ts = exec_target_ts + REJECT_COOLDOWN_SEC
                     continue
 
                 if fill.vwap > min(cfg.max_entry_price, dec.top_ask + max_slippage):
                     log_bt_reject("SLIPPAGE_EXCEEDED", fill)
-                    reject_cooldown_ts = exec_target_ts + 3.0
+                    reject_cooldown_ts = exec_target_ts + REJECT_COOLDOWN_SEC
                     continue
 
-                # 成交立即扣减本金并更新峰值和最大回撤
+                # 成交立即扣减本金、刷新峰值与最大回撤，且只有 FILLED 才占用单场额度
                 eq_after_fill, peak_after_fill, _ = bookkeeper.apply_fill(fill.cost_usdc)
                 strat.sync_drawdown_state(eq_after_fill, peak_after_fill)
 
@@ -1850,8 +1394,10 @@ def export_replay_backtest(
                     exec_q, exec_mark_px, exec_book_age_ms, exec_book_stale, fill, "FILLED", "", eq_after_fill,
                 )
                 order_status_counts["FILLED"] = order_status_counts.get("FILLED", 0) + 1
-                strat.market_trades[m.outcome_id] = strat.market_trades.get(m.outcome_id, 0) + 1
+                strat.record_fill(m.outcome_id)
                 filled_orders_this_market.append((orow, dec.eff_settle_fee))
+
+            strat.in_flight_markets.discard(m.outcome_id)
 
             outcome_logger.append({
                 "run_id": run_id,
@@ -1929,11 +1475,40 @@ def export_replay_backtest(
         "win_rate_pct": summary["win_rate_pct"],
         "order_status_breakdown": summary["order_status_breakdown"],
     }, ensure_ascii=False, indent=2))
-    return True
+    return True, summary
+
+
+def export_replay_backtest(
+    db_path: str,
+    cfg: StrategyConfig,
+    latency_ms: int,
+    max_slippage: float,
+    stale_book_ms: float,
+    decision_sample_sec: float,
+    near_edge_margin: float,
+    out_dir_arg: str,
+    out_root_arg: str,
+    subdir_by_run_id: bool,
+    network: str = "mainnet",
+) -> bool:
+    ok, _ = run_unified_replay_backtest(
+        db_path=db_path,
+        cfg=cfg,
+        latency_ms=latency_ms,
+        max_slippage=max_slippage,
+        stale_book_ms=stale_book_ms,
+        decision_sample_sec=decision_sample_sec,
+        near_edge_margin=near_edge_margin,
+        out_dir_arg=out_dir_arg,
+        out_root_arg=out_root_arg,
+        subdir_by_run_id=subdir_by_run_id,
+        network=network,
+    )
+    return ok
 
 
 # ============================================================
-# 8. CLI 入口（保留 --out-dir 默认路径，并兼容 --out-root）
+# 7. CLI 入口（保留 --out-dir 默认路径，并兼容 --out-root）
 # ============================================================
 
 def main():

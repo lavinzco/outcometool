@@ -28,6 +28,8 @@ python outcome_paper_export.py export-backtest --db hip4_replay.sqlite --out-dir
 
 `paper` 会把同一份行情磁带写入 `--db`（默认 `hip4_replay.sqlite`，与 `record` 同结构），纸面结束后可直接拿这份 SQLite 换参数跑 `export-backtest`，不必为同一时段另开 `record`。不要对同一个 SQLite 文件同时并发运行 `record` 和 `paper`；需要可回放纸面时只跑 `paper --db ...` 即可。
 
+调参和历史回放统一以 `outcome_paper_export.py export-backtest` 为准；`outcome_hip4_engine.py backtest` 现已转调同一条回放、撮合与账本路径（成交扣本金、结算只加兑付、拒单不占单场额度），不再存在独立的打印式回测结果。
+
 `--settlement-fee` 默认 `0.0007`，只是可配参数，不是已核实的官方费率。这个工具只做纸面模拟，不下真单。
 
 `discover`、`record` 和 `paper` 的默认 `--period` 仍是 `15m`。HIP-4 重复盘的周期在描述的 `period:` 里（例如 `1d`）。`template:binaryPrice` 没有这个字段；描述里的 `seconds` 是结算 TWAP 的秒数，不是合约周期。这类盘的周期用 Outcome lookup 返回的 `metadata.period`。查不到时不会拿 `seconds` 来顶替，15 分钟筛选就不会把这张盘算进去。
